@@ -1147,10 +1147,13 @@ class CtxRushKrea2OminiApply:
         print(f'[CtxRushKrea2OminiApply] reference encoded at {width}x{height}, latent {tuple(latent.shape)}')
         lora_state = {'entries': entries, 'device': None}
 
-        def wrapper(executor, x, timesteps, context, attention_mask=None, transformer_options=None, **kwargs):
+        def wrapper(executor, x, timesteps, context, *args, **kwargs):
+            transformer_options = kwargs.get('transformer_options')
+            if transformer_options is None:
+                transformer_options = next((a for a in args if isinstance(a, dict)), {})
             return _krea2_omini_forward(
                 executor.class_obj, x, timesteps, context, src, lora_state, strength,
-                transformer_options if transformer_options is not None else {},
+                transformer_options,
                 reference_timestep=reference_timestep,
             )
 
@@ -1354,10 +1357,15 @@ class CtxRushKrea2OminiGroundedApply:
         src = patched.model.process_latent_in(reference.latent)
         blocks_state = {'entries': block_entries, 'device': None}
 
-        def wrapper(executor, x, timesteps, context, attention_mask=None, transformer_options=None, **kwargs):
+        def wrapper(executor, x, timesteps, context, *args, **kwargs):
+            # Keep this variadic because Krea 2 forward positional arguments can
+            # change between host versions. Only transformer_options is needed.
+            transformer_options = kwargs.get('transformer_options')
+            if transformer_options is None:
+                transformer_options = next((a for a in args if isinstance(a, dict)), {})
             return _krea2_omini_grounded_forward(
                 executor.class_obj, x, timesteps, context, src, blocks_state, fusion_entries,
-                block_strength, transformer_options if transformer_options is not None else {},
+                block_strength, transformer_options,
                 fusion_strength=fusion_strength, reference_timestep=reference_timestep,
             )
 
