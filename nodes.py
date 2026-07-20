@@ -1342,7 +1342,9 @@ class CtxRushKrea2OminiGroundedApply:
                 'fusion_strength': ('FLOAT', {'default': 1.0, 'min': 0.0, 'max': 4.0, 'step': 0.05,
                                               'tooltip': 'Escala do LoRA GLOBAL do txtfusion (semântica do grounding). 0 = txtfusion do adapter desligado (mede quanto vem do built-in).'}),
                 'reference_strength': ('FLOAT', {'default': 1.0, 'min': 0.0, 'max': 1.5, 'step': 0.05,
-                                                 'tooltip': 'Escala do LATENT da referência antes do empacotamento — o dial real de influência (o base copia os tokens mesmo com block_strength 0). 0.4-0.7 = influência leve.'}),
+                                                 'tooltip': 'Escala LINEAR do latent (quebra a estatística; abaixo de 1 tende a ruído). Prefira reference_noise.'}),
+                'reference_noise': ('FLOAT', {'default': 0.0, 'min': 0.0, 'max': 1.0, 'step': 0.05,
+                                              'tooltip': 'O dial RECOMENDADO de influência: mistura ruído na referência pela fórmula do flow ((1-a)*ref + a*ruído). 0 = ref total; 0.3-0.5 = influência leve; 1 = ref vira ruído puro. Em-distribuição, não "mata" a imagem.'}),
                 'start_percent': ('FLOAT', {'default': 0.0, 'min': 0.0, 'max': 1.0, 'step': 0.01,
                                             'tooltip': 'Início da janela de atividade do adapter (fração do denoise).'}),
                 'end_percent': ('FLOAT', {'default': 1.0, 'min': 0.0, 'max': 1.0, 'step': 0.01,
@@ -1394,6 +1396,7 @@ class CtxRushKrea2OminiGroundedApply:
               vl_longest_side=768, vl_prompt_style='plain',
               reference_fit='training_crop', reference_timestep='zero',
               negative_grounding='grounded', reference_strength=1.0,
+              reference_noise=0.0,
               start_percent=0.0, end_percent=1.0, strength_curve='constant',
               curve_power=1.0, layers='all', layer_taper='flat',
               schedule_reference=False):
@@ -1442,6 +1445,12 @@ class CtxRushKrea2OminiGroundedApply:
         src = patched.model.process_latent_in(reference.latent)
         if reference_strength != 1.0:
             src = src * float(reference_strength)
+        if reference_noise > 0:
+            # Use one fixed noise sample per generation so it remains stable
+            # across denoise steps while following the flow interpolation.
+            reference_epsilon = torch.randn_like(src)
+            noise_strength = float(reference_noise)
+            src = (1.0 - noise_strength) * src + noise_strength * reference_epsilon
         blocks_state = {'entries': block_entries, 'device': None}
 
         def wrapper(executor, x, timesteps, context, *args, **kwargs):
