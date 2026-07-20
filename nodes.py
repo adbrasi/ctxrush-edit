@@ -15,6 +15,7 @@ advanced workflows without encoding the VAE reference twice.
 
 from dataclasses import dataclass
 import math
+import re
 
 import torch
 from einops import rearrange
@@ -983,17 +984,27 @@ class _MaskedLoraScope:
     def __enter__(self):
         s, e = self.span
         seq_len, scale = self.seq_len, self.scale
-        for module, lora_a, lora_b in self.entries:
+        for entry in self.entries:
+            module, lora_a, lora_b = entry[:3]
+            entry_scale = entry[3] if len(entry) > 3 else 1.0
             orig = module.forward
 
-            def wrapped(x, *args, _orig=orig, _a=lora_a, _b=lora_b, **kwargs):
+            def wrapped(
+                x,
+                *args,
+                _orig=orig,
+                _a=lora_a,
+                _b=lora_b,
+                _entry_scale=entry_scale,
+                **kwargs,
+            ):
                 out = _orig(x, *args, **kwargs)
                 if x.ndim >= 3 and x.shape[-2] == seq_len:
                     piece = x[..., s:e, :].to(_a.dtype)
                     delta = torch.nn.functional.linear(
                         torch.nn.functional.linear(piece, _a), _b
                     )
-                    out[..., s:e, :] += (delta * scale).to(out.dtype)
+                    out[..., s:e, :] += (delta * scale * _entry_scale).to(out.dtype)
                 return out
 
             self._originals.append((module, orig))
@@ -1230,7 +1241,10 @@ def _krea2_omini_grounded_forward(m, x, timesteps, context, src_latent, blocks_s
 
     entries = blocks_state['entries']
     if blocks_state.get('device') != device:
-        entries = [(mod, a.to(device), b.to(device)) for mod, a, b in entries]
+        entries = [
+            (entry[0], entry[1].to(device), entry[2].to(device), *entry[3:])
+            for entry in entries
+        ]
         blocks_state['entries'] = entries
         blocks_state['device'] = device
 
@@ -1256,6 +1270,57 @@ class _NullScope:
         return False
 
 
+def _ctxrush_schedule_mult(sigma, start_percent, end_percent, curve, power):
+    """Return the strength multiplier for the current denoise progress."""
+    progress = 1.0 - max(0.0, min(1.0, float(sigma)))
+    span = max(1e-6, end_percent - start_percent)
+    if progress < start_percent or progress > end_percent:
+        return 0.0
+    u = (progress - start_percent) / span
+    if curve == 'constant':
+        value = 1.0
+    elif curve == 'fade_out':
+        value = 1.0 - u
+    elif curve == 'fade_in':
+        value = u
+    else:  # fade_in_out
+        value = 1.0 - abs(2.0 * u - 1.0)
+    return max(0.0, value) ** max(0.05, float(power))
+
+
+def _ctxrush_layer_scales(entries_with_path, layers, layer_taper):
+    """Filter LoRA entries by block range and attach a per-layer scale."""
+    if layers.strip().lower() in ('', 'all'):
+        low, high = 0, 10**9
+    else:
+        try:
+            low, high = (int(value) for value in layers.replace(' ', '').split('-'))
+        except Exception as error:
+            raise ValueError(
+                f"layers deve ser 'all' ou 'inicio-fim' (ex. 4-24), recebi: {layers!r}"
+            ) from error
+
+    output = []
+    for module, lora_a, lora_b, path in entries_with_path:
+        match = re.search(r'blocks\.(\d+)\.', path)
+        index = int(match.group(1)) if match else 0
+        if not (low <= index <= high):
+            continue
+        if layer_taper == 'flat' or high <= low:
+            scale = 1.0
+        else:
+            position = (index - low) / max(1, min(high, 27) - low)
+            scale = (
+                1.0 - 0.8 * position
+                if layer_taper == 'fade_deep'
+                else 0.2 + 0.8 * position
+            )
+        output.append((module, lora_a, lora_b, scale))
+    if not output:
+        raise ValueError(f'Nenhum block na faixa de layers {layers!r}')
+    return output
+
+
 class CtxRushKrea2OminiGroundedApply:
     """All-in-one for adapters trained with type=krea2_omini_grounded: omini
     core (width-shift, refs t=0, condition-only block LoRA) + Qwen3-VL
@@ -1278,6 +1343,20 @@ class CtxRushKrea2OminiGroundedApply:
                                               'tooltip': 'Escala do LoRA GLOBAL do txtfusion (semântica do grounding). 0 = txtfusion do adapter desligado (mede quanto vem do built-in).'}),
                 'reference_strength': ('FLOAT', {'default': 1.0, 'min': 0.0, 'max': 1.5, 'step': 0.05,
                                                  'tooltip': 'Escala do LATENT da referência antes do empacotamento — o dial real de influência (o base copia os tokens mesmo com block_strength 0). 0.4-0.7 = influência leve.'}),
+                'start_percent': ('FLOAT', {'default': 0.0, 'min': 0.0, 'max': 1.0, 'step': 0.01,
+                                            'tooltip': 'Início da janela de atividade do adapter (fração do denoise).'}),
+                'end_percent': ('FLOAT', {'default': 1.0, 'min': 0.0, 'max': 1.0, 'step': 0.01,
+                                          'tooltip': 'Fim da janela de atividade.'}),
+                'strength_curve': (['constant', 'fade_out', 'fade_in', 'fade_in_out'], {'default': 'constant',
+                                   'tooltip': 'Curva da força ao longo dos steps. fade_out = 100% no início → 0 no fim.'}),
+                'curve_power': ('FLOAT', {'default': 1.0, 'min': 0.1, 'max': 4.0, 'step': 0.1,
+                                          'tooltip': '1 = linear; >1 = curva mais agressiva.'}),
+                'layers': ('STRING', {'default': 'all',
+                                      'tooltip': "Faixa de blocks afetados: 'all' ou 'inicio-fim' (0-27). Ex.: 4-24."}),
+                'layer_taper': (['flat', 'fade_deep', 'fade_shallow'], {'default': 'flat',
+                                'tooltip': 'Escala por camada dentro da faixa: flat=igual; fade_deep=cai nas profundas; fade_shallow=cai nas rasas.'}),
+                'schedule_reference': ('BOOLEAN', {'default': False,
+                                       'tooltip': 'Aplica a mesma curva também ao latent da referência (fade da própria ref).'}),
                 'model_variant': (['raw', 'turbo'], {'default': 'raw'}),
                 'width': ('INT', {'default': 672, 'min': 64, 'max': 4096, 'step': 16}),
                 'height': ('INT', {'default': 384, 'min': 64, 'max': 4096, 'step': 16}),
@@ -1314,7 +1393,10 @@ class CtxRushKrea2OminiGroundedApply:
               model_variant='raw', width=672, height=384, batch_size=1,
               vl_longest_side=768, vl_prompt_style='plain',
               reference_fit='training_crop', reference_timestep='zero',
-              negative_grounding='grounded', reference_strength=1.0):
+              negative_grounding='grounded', reference_strength=1.0,
+              start_percent=0.0, end_percent=1.0, strength_curve='constant',
+              curve_power=1.0, layers='all', layer_taper='flat',
+              schedule_reference=False):
         reference = _build_reference(
             vae, image, width, height, reference_fit,
             vl_longest_side=vl_longest_side,
@@ -1347,9 +1429,10 @@ class CtxRushKrea2OminiGroundedApply:
             elif path.startswith('txtfusion'):
                 fusion_entries.append((module, a.cuda(), b.cuda()))
             else:
-                block_entries.append((module, a.cuda(), b.cuda()))
+                block_entries.append((module, a.cuda(), b.cuda(), path))
         if not block_entries:
             raise ValueError('No block LoRA modules matched the diffusion model')
+        block_entries = _ctxrush_layer_scales(block_entries, layers, layer_taper)
         if missing:
             print(f'[OminiGrounded] WARNING: {len(missing)} LoRA keys not matched (e.g. {missing[:3]})')
         print(f'[OminiGrounded] runtime LoRA: {len(block_entries)} block linears (masked, '
@@ -1367,10 +1450,28 @@ class CtxRushKrea2OminiGroundedApply:
             transformer_options = kwargs.get('transformer_options')
             if transformer_options is None:
                 transformer_options = next((a for a in args if isinstance(a, dict)), {})
+            sigma = (
+                float(timesteps.flatten()[0])
+                if hasattr(timesteps, 'flatten')
+                else float(timesteps)
+            )
+            multiplier = _ctxrush_schedule_mult(
+                sigma,
+                start_percent,
+                end_percent,
+                strength_curve,
+                curve_power,
+            )
+            src_step = (
+                src * multiplier
+                if schedule_reference and multiplier != 1.0
+                else src
+            )
             return _krea2_omini_grounded_forward(
-                executor.class_obj, x, timesteps, context, src, blocks_state, fusion_entries,
-                block_strength, transformer_options,
-                fusion_strength=fusion_strength, reference_timestep=reference_timestep,
+                executor.class_obj, x, timesteps, context, src_step, blocks_state,
+                fusion_entries, block_strength * multiplier, transformer_options,
+                fusion_strength=fusion_strength * multiplier,
+                reference_timestep=reference_timestep,
             )
 
         to = patched.model_options.setdefault('transformer_options', {})
