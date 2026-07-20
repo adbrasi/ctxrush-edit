@@ -1276,6 +1276,8 @@ class CtxRushKrea2OminiGroundedApply:
                                              'tooltip': 'Escala dos deltas ROUTADOS nos blocks (fidelidade à referência).'}),
                 'fusion_strength': ('FLOAT', {'default': 1.0, 'min': 0.0, 'max': 4.0, 'step': 0.05,
                                               'tooltip': 'Escala do LoRA GLOBAL do txtfusion (semântica do grounding). 0 = txtfusion do adapter desligado (mede quanto vem do built-in).'}),
+                'reference_strength': ('FLOAT', {'default': 1.0, 'min': 0.0, 'max': 1.5, 'step': 0.05,
+                                                 'tooltip': 'Escala do LATENT da referência antes do empacotamento — o dial real de influência (o base copia os tokens mesmo com block_strength 0). 0.4-0.7 = influência leve.'}),
                 'model_variant': (['raw', 'turbo'], {'default': 'raw'}),
                 'width': ('INT', {'default': 672, 'min': 64, 'max': 4096, 'step': 16}),
                 'height': ('INT', {'default': 384, 'min': 64, 'max': 4096, 'step': 16}),
@@ -1312,7 +1314,7 @@ class CtxRushKrea2OminiGroundedApply:
               model_variant='raw', width=672, height=384, batch_size=1,
               vl_longest_side=768, vl_prompt_style='plain',
               reference_fit='training_crop', reference_timestep='zero',
-              negative_grounding='grounded'):
+              negative_grounding='grounded', reference_strength=1.0):
         reference = _build_reference(
             vae, image, width, height, reference_fit,
             vl_longest_side=vl_longest_side,
@@ -1355,6 +1357,8 @@ class CtxRushKrea2OminiGroundedApply:
               f'(global, strength {fusion_strength})')
 
         src = patched.model.process_latent_in(reference.latent)
+        if reference_strength != 1.0:
+            src = src * float(reference_strength)
         blocks_state = {'entries': block_entries, 'device': None}
 
         def wrapper(executor, x, timesteps, context, *args, **kwargs):
