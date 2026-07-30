@@ -38,6 +38,7 @@ global com strength separada, refs a t=0 per-token, mu oficial por
 resolução (raw) ou 1.15 (turbo), janela/curva de strength por step.
 """
 
+import contextlib
 import json
 import struct
 
@@ -68,6 +69,49 @@ from .nodes import (
     _load_omini_lora,
     _require_single_image,
 )
+
+
+@contextlib.contextmanager
+def _training_vl_contract(enabled=True):
+    """Restaura o contrato de encode de texto/visão sob o qual o adapter treinou.
+
+    O ComfyUI atual tem um `Qwen3VL.forward` próprio (comfy/text_encoders/
+    qwen3vl.py) que usa **MRoPE 3D** e injeta **DeepStack** nos tokens de
+    visão. O ComfyUI que treinou este adapter (submodules/ComfyUI do fork
+    diffusion-pipe) não tem esse override e cai em `BaseLlama.forward`:
+    position_ids simples, sem DeepStack.
+
+    Medido, mesmo prompt/imagem/pesos: o contexto diverge com relL2 = 1.36
+    (maior que o próprio sinal), cosseno médio 0.83, 152/169 tokens abaixo de
+    0.99. SEM imagem os dois batem em 8 casas — a divergência é exclusiva do
+    caminho de grounding visual.
+
+    Consequência: o `txtfusion` (o canal que LÊ a referência) recebe uma
+    distribuição fora daquela em que foi treinado. Os blocks continuam
+    aplicando o delta, então estilo e composição saem — mas a identidade não.
+    É o sintoma "personagem parecido, não o mesmo".
+
+    Este contexto desfaz o override APENAS durante o encode, e restaura em
+    seguida. Em ComfyUI antigo (sem override) é no-op.
+    """
+    if not enabled:
+        yield
+        return
+    try:
+        import comfy.text_encoders.qwen3vl as _q3
+        from comfy.text_encoders.llama import BaseLlama
+    except Exception:
+        yield
+        return
+    own = _q3.Qwen3VL.__dict__.get('forward')
+    if own is None:  # ComfyUI já no contrato do treino
+        yield
+        return
+    _q3.Qwen3VL.forward = BaseLlama.forward
+    try:
+        yield
+    finally:
+        _q3.Qwen3VL.forward = own
 
 
 def _read_safetensors_metadata(path):
@@ -176,7 +220,7 @@ class _CountingMaskedLoraScope(_MaskedLoraScope):
 def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
                             fusion_entries, strength, transformer_options,
                             fusion_strength, reference_timestep, slot_axis,
-                            position_offset):
+                            position_offset, text_attention_mask=None):
     """Espelho fiel de Krea2MultiRefInitialLayer.forward (o que treinou):
     N spans concatenados após o target, offset RoPE cumulativo por slot,
     t=0 (ou target) per-token nos spans, txtfusion antes do txtmlp."""
@@ -275,9 +319,35 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
         _dbg(_tensor_stats('contexto de texto (pos txtfusion)', context))
         _dbg(f'strength: blocks={strength} txtfusion={fusion_scale} '
              f'| entries: {len(entries)} blocks, {len(fusion_entries)} txtfusion')
+    # MASCARA DE ATENCAO — o trainer SEMPRE passa uma (krea2_multiref.py:150-166):
+    #   valid_keys = cat([text_attention_mask, ones(target+refs)]) -> (B,1,1,L)
+    # Sem ela, o softmax de cada bloco tambem distribui peso sobre as chaves de
+    # PADDING do texto, diluindo os tokens reais — inclusive os da referencia.
+    # Como o adapter aprendeu a ler a referencia SOB a mascara, omiti-la faz o
+    # sinal da referencia chegar enfraquecido ("como se a LoRA estivesse
+    # desligada"). Reconstruimos exatamente o mesmo tensor.
+    if text_attention_mask is None:
+        text_valid = torch.ones(bs, txtlen, dtype=torch.bool, device=device)
+    else:
+        text_valid = text_attention_mask.to(device=device, dtype=torch.bool)
+        if text_valid.ndim > 2:
+            text_valid = text_valid.reshape(text_valid.shape[0], -1)
+        if text_valid.shape[0] != bs:
+            text_valid = text_valid[:1].expand(bs, -1)
+        if text_valid.shape[1] != txtlen:  # contrato quebrado -> nao arrisca
+            text_valid = torch.ones(bs, txtlen, dtype=torch.bool, device=device)
+    image_valid = torch.ones(bs, tgtlen + reflen, dtype=torch.bool, device=device)
+    attention_mask = torch.cat([text_valid, image_valid], dim=1)[:, None, None, :]
+    if _DEBUG['on'] and _DEBUG['calls'] == 1:
+        origem = 'conditioning' if text_attention_mask is not None else 'ASSUMIDA (tudo valido)'
+        _dbg(f'mascara de atencao: shape={tuple(attention_mask.shape)} '
+             f'chaves validas={int(attention_mask.sum())}/{seq_len} '
+             f'(texto {int(text_valid.sum())}/{txtlen}) | origem={origem}')
+
     with _CountingMaskedLoraScope(entries, txtlen + tgtlen, seq_len, seq_len, strength):
         for block in m.blocks:
-            combined = block(combined, tvec, freqs, None, transformer_options=transformer_options)
+            combined = block(combined, tvec, freqs, attention_mask,
+                             transformer_options=transformer_options)
     if _DEBUG['on'] and _DEBUG['calls'] == 1:
         hits, misses = _DEBUG['lora_hits'], _DEBUG['lora_misses']
         veredito = ('OK' if hits and not misses else
@@ -343,6 +413,13 @@ class CtxRushKrea2MultiRefApply:
                 'curve_power': ('FLOAT', {'default': 1.0, 'min': 0.1, 'max': 4.0, 'step': 0.1}),
                 'layers': ('STRING', {'default': 'all', 'tooltip': "'all' ou faixa 'inicio-fim' (0-27)."}),
                 'layer_taper': (['flat', 'fade_deep', 'fade_shallow'], {'default': 'flat'}),
+                'training_vl_contract': ('BOOLEAN', {'default': True,
+                          'tooltip': 'Encoda texto/visao sob o contrato do TREINO. O ComfyUI atual '
+                                     'usa MRoPE 3D + DeepStack no Qwen3-VL; o ComfyUI que treinou '
+                                     'este adapter nao usava. Sem isto o txtfusion (o canal que LE a '
+                                     'referencia) recebe uma distribuicao fora da de treino e a '
+                                     'identidade do personagem nao e preservada — "parecido, nao o '
+                                     'mesmo". Desligue so para adapters treinados com ComfyUI novo.'}),
                 'debug': ('BOOLEAN', {'default': False,
                           'tooltip': 'Loga no console TUDO que define o resultado: hashes e dtypes dos '
                                      'modelos, contrato lido da metadata, prompt VL literal, geometria da '
@@ -369,7 +446,7 @@ class CtxRushKrea2MultiRefApply:
               reference_timestep='auto', negative_grounding='grounded',
               reference_noise=0.0, start_percent=0.0, end_percent=1.0,
               strength_curve='constant', curve_power=1.0,
-              layers='all', layer_taper='flat', debug=False):
+              layers='all', layer_taper='flat', training_vl_contract=True, debug=False):
         _DEBUG.update(on=bool(debug), calls=0, lora_hits=0, lora_misses=0, logged=False)
         lora_path = folder_paths.get_full_path('loras', lora_name)
         metadata = _read_safetensors_metadata(lora_path)
@@ -468,7 +545,8 @@ class CtxRushKrea2MultiRefApply:
         def encode(prompt, grounded=True):
             if not grounded:
                 tokens = clip.tokenize(prompt, llama_template=KREA2_TEMPLATE)
-                return clip.encode_from_tokens_scheduled(tokens)
+                with _training_vl_contract(training_vl_contract):
+                    return clip.encode_from_tokens_scheduled(tokens)
             text = _build_vl_prompt(len(vl_images), prompt,
                                     contract['prompt_style'], contract['vl_label'])
             if debug:
@@ -476,7 +554,19 @@ class CtxRushKrea2MultiRefApply:
                 _dbg(f'prompt VL enviado ao Qwen3-VL ({len(text)} chars): '
                      f'{shown[:300]}{"…" if len(shown) > 300 else ""}')
             tokens = clip.tokenize(text, images=vl_images, llama_template=KREA2_TEMPLATE)
-            return clip.encode_from_tokens_scheduled(tokens)
+            with _training_vl_contract(training_vl_contract):
+                cond = clip.encode_from_tokens_scheduled(tokens)
+            if debug:
+                try:
+                    t0 = cond[0][0]
+                    _dbg(f'contexto do encode: shape={tuple(t0.shape)} '
+                         f'norm={t0.float().norm():.2f} std={t0.float().std():.5f} '
+                         f'| contrato_treino={"ON" if training_vl_contract else "OFF"} '
+                         f'(referencia do treino: norm~15813 std~6.94; '
+                         f'ComfyUI novo sem o fix: norm~17178 std~7.54)')
+                except Exception:
+                    pass
+            return cond
 
         if debug:
             for i, (im, lat) in enumerate(zip(vl_images, ref_latents)):
@@ -528,6 +618,13 @@ class CtxRushKrea2MultiRefApply:
             transformer_options = kwargs.get('transformer_options')
             if transformer_options is None:
                 transformer_options = next((a for a in args if isinstance(a, dict)), {})
+            # O ComfyUI entrega a mascara de padding do texto como
+            # 'attention_mask' (kwarg) ou no primeiro posicional apos context
+            # (ver comfy/ldm/krea2/model.py:276). O trainer a usa em todos os
+            # blocos; sem ela o padding do texto rouba peso do softmax.
+            text_mask = kwargs.get('attention_mask')
+            if text_mask is None:
+                text_mask = next((a for a in args if torch.is_tensor(a) and a.ndim <= 2), None)
             sigma = (float(timesteps.flatten()[0]) if hasattr(timesteps, 'flatten')
                      else float(timesteps))
             multiplier = _ctxrush_schedule_mult(
@@ -539,6 +636,7 @@ class CtxRushKrea2MultiRefApply:
                 reference_timestep=contract['reference_timestep'],
                 slot_axis=contract['slot_axis'],
                 position_offset=contract['position_offset'],
+                text_attention_mask=text_mask,
             )
 
         to = patched.model_options.setdefault('transformer_options', {})
