@@ -32,4 +32,15 @@ try:
 except Exception as _err:  # pragma: no cover
     print(f'[CtxRush] K2 Training Base indisponivel: {_err!r}')
 
+
+try:
+    from .nodes_runner_bridge import (
+        NODE_CLASS_MAPPINGS as _RB_CLASSES,
+        NODE_DISPLAY_NAME_MAPPINGS as _RB_NAMES,
+    )
+    NODE_CLASS_MAPPINGS = {**NODE_CLASS_MAPPINGS, **_RB_CLASSES}
+    NODE_DISPLAY_NAME_MAPPINGS = {**NODE_DISPLAY_NAME_MAPPINGS, **_RB_NAMES}
+except Exception as _err:  # pragma: no cover
+    print(f'[CtxRush] K2 Runner Bridge indisponivel: {_err!r}')
+
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
