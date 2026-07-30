@@ -400,7 +400,45 @@ class CtxRushKrea2MultiRefApply:
                 dts = {}
                 for p in dm.parameters():
                     dts[str(p.dtype)] = dts.get(str(p.dtype), 0) + 1
+                dominante = max(dts, key=dts.get)
                 _dbg(f'base DiT: {type(dm).__name__} | dtypes={dts}')
+                # O delta da LoRA e aplicado em runtime bf16 sobre a saida das
+                # Linears. Se os pesos do DiT estiverem materializados em fp8, a
+                # saida ja vem quantizada e o delta jovem do adapter e engolido
+                # pelo passo de quantizacao — a referencia "quase" aparece.
+                # bf16 e o contrato: o proprio trainer roda o base fp8-scaled
+                # DEQUANTIZADO para bf16 em tempo de execucao.
+                if 'bfloat16' in dominante:
+                    _dbg(f'dtype do DiT: OK (bfloat16 dominante, {dts[dominante]} tensores) — '
+                         f'o delta da LoRA e aplicado com fidelidade')
+                elif 'float8' in dominante:
+                    _dbg(f'dtype do DiT: ATENCAO — pesos dominantes em {dominante}. '
+                         f'O adapter foi treinado com o base DEQUANTIZADO em bf16; com o DiT '
+                         f'materializado em fp8 o delta routado perde resolucao numerica e a '
+                         f'fidelidade da referencia cai. Carregue o UNETLoader com '
+                         f'weight_dtype=default (nao fp8_e4m3fn/fp8_e5m2).')
+                else:
+                    _dbg(f'dtype do DiT: {dominante} dominante ({dts[dominante]} tensores) — '
+                         f'fora do contrato de treino (bfloat16); resultado pode divergir.')
+                try:
+                    te_dts = {}
+                    for p in clip.cond_stage_model.parameters():
+                        te_dts[str(p.dtype)] = te_dts.get(str(p.dtype), 0) + 1
+                    te_dom = max(te_dts, key=te_dts.get)
+                    te_fp8 = any('float8' in k for k in te_dts)
+                    _dbg(f'text encoder (Qwen3-VL): dtypes={te_dts}')
+                    if te_fp8:
+                        n8 = sum(v for k, v in te_dts.items() if 'float8' in k)
+                        _dbg(f'dtype do text encoder: ATENCAO — {n8} tensores em fp8. '
+                             f'O treino usou qwen3vl_4b_bf16. O grounding depende deste '
+                             f'encoder para LER a referencia; em fp8 a percepcao fina '
+                             f'(rosto/identidade) degrada antes de qualquer outra coisa. '
+                             f'Se a saida sai "parecida mas nao igual", teste o bf16.')
+                    else:
+                        _dbg(f'dtype do text encoder: OK ({te_dom} dominante) — '
+                             f'precisao igual ou melhor que a do treino (bf16)')
+                except Exception as e:
+                    _dbg(f'text encoder: <inspecao falhou: {e!r}>')
             except Exception as e:
                 _dbg(f'base DiT: <inspecao falhou: {e!r}>')
             _dbg(f'contrato efetivo: {contract}')
