@@ -185,6 +185,54 @@ def _tensor_stats(name, t):
         return f'{name}: <stats falhou: {e!r}>'
 
 
+def _elo_save(prefix, name, value):
+    """Opt-in tensor dump for runner-vs-node forward bisection."""
+    if not prefix:
+        return
+    import os
+    import numpy as np
+
+    path = f'{prefix}.{name}.npy'
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    if not os.path.exists(path):
+        np.save(path, value.detach().float().cpu().numpy())
+
+
+def _elo_sequence_snapshot(prefix, name, combined, text_length, target_length,
+                           timestep_features=None, tvec=None, freqs=None,
+                           attention_mask=None):
+    if not prefix:
+        return
+    sequence_length = combined.shape[1]
+    indices = sorted({
+        0,
+        max(text_length - 1, 0),
+        text_length,
+        text_length + target_length // 2,
+        text_length + target_length - 1,
+        text_length + target_length,
+        sequence_length - 1,
+    })
+    indices = [index for index in indices if 0 <= index < sequence_length]
+    index_tensor = torch.tensor(indices, device=combined.device)
+    _elo_save(prefix, f'{name}.indices', index_tensor)
+    _elo_save(prefix, f'{name}.selected', combined[:, indices])
+    work = combined.detach().float()
+    _elo_save(prefix, f'{name}.row_mean', work.mean(dim=-1))
+    _elo_save(prefix, f'{name}.row_std', work.std(dim=-1))
+    _elo_save(prefix, f'{name}.row_norm', torch.linalg.vector_norm(work, dim=-1))
+    if timestep_features is not None:
+        _elo_save(prefix, f'{name}.timestep_features', timestep_features)
+    if tvec is not None:
+        _elo_save(prefix, f'{name}.tvec_selected', tvec[:, indices])
+    if freqs is not None:
+        _elo_save(prefix, f'{name}.freqs_selected', freqs.index_select(-4, index_tensor))
+    if attention_mask is not None:
+        _elo_save(prefix, f'{name}.attention_mask', attention_mask)
+
+
 class _TrainingBaseQuant:
     """Reproduz a base numérica sobre a qual o adapter foi treinado.
 
@@ -271,6 +319,15 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
     """Espelho fiel de Krea2MultiRefInitialLayer.forward (o que treinou):
     N spans concatenados após o target, offset RoPE cumulativo por slot,
     t=0 (ou target) per-token nos spans, txtfusion antes do txtmlp."""
+    import os as _os_probe
+    dump_prefix = _os_probe.environ.get('NODE_DUMP')
+    source_prefix = _os_probe.environ.get('NODE_BISECT_SOURCE')
+    if source_prefix:
+        import numpy as _np_probe
+        raw_context = torch.from_numpy(_np_probe.load(source_prefix + '.cond0.npy'))
+        context = raw_context.to(device=context.device, dtype=context.dtype)
+        raw_reference = torch.from_numpy(_np_probe.load(source_prefix + '.ref.npy'))
+        ref_latents = [raw_reference]
     temporal = x.ndim == 5
     if temporal:
         b5, c5, t5, h5, w5 = x.shape
@@ -283,7 +340,9 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
     device = x.device
 
     context = m._unpack_context(context)
+    _elo_save(dump_prefix, 'context_raw', context)
     tgt = m.first(rearrange(x, 'b c (h ph) (w pw) -> b (h w) (c ph pw)', ph=patch, pw=patch))
+    _elo_save(dump_prefix, 'target_tokens', tgt)
 
     # --- N spans de referência, offset cumulativo -------------------------
     ref_tokens_list, ref_pos_list = [], []
@@ -311,6 +370,8 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
         ref_pos_list.append(pos)
     ref = torch.cat(ref_tokens_list, dim=1)
     refpos = torch.cat(ref_pos_list, dim=1)
+    _elo_save(dump_prefix, 'reference_input', ref_latents[0])
+    _elo_save(dump_prefix, 'reference_tokens', ref)
 
     t = m.tmlp(timestep_embedding(timesteps, m.tdim).unsqueeze(1).to(tgt.dtype))
     tvec_t = m.tproj(t)
@@ -319,7 +380,9 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
     use_fusion = bool(fusion_entries) and fusion_scale > 0
     with _FullLoraScope(fusion_entries, fusion_scale) if use_fusion else _NullScope():
         context = m.txtfusion(context, mask=None, transformer_options=transformer_options)
+    _elo_save(dump_prefix, 'context_txtfusion', context)
     context = m.txtmlp(context)
+    _elo_save(dump_prefix, 'context_txtmlp', context)
 
     txtlen, tgtlen, reflen = context.shape[1], tgt.shape[1], ref.shape[1]
     combined = torch.cat([context, tgt, ref], dim=1)
@@ -385,6 +448,12 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
             text_valid = torch.ones(bs, txtlen, dtype=torch.bool, device=device)
     image_valid = torch.ones(bs, tgtlen + reflen, dtype=torch.bool, device=device)
     attention_mask = torch.cat([text_valid, image_valid], dim=1)[:, None, None, :]
+    if _DEBUG['calls'] == 1:
+        _elo_sequence_snapshot(
+            dump_prefix, 'layer00_initial', combined, txtlen, tgtlen,
+            timestep_features=t, tvec=tvec, freqs=freqs,
+            attention_mask=attention_mask,
+        )
     if _DEBUG['on'] and _DEBUG['calls'] == 1:
         origem = 'conditioning' if text_attention_mask is not None else 'ASSUMIDA (tudo valido)'
         _dbg(f'mascara de atencao: shape={tuple(attention_mask.shape)} '
@@ -393,9 +462,14 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
 
     quant_ctx = _TrainingBaseQuant(entries) if training_base_quant else _NullScope()
     with quant_ctx, _CountingMaskedLoraScope(entries, txtlen + tgtlen, seq_len, seq_len, strength):
-        for block in m.blocks:
+        for block_index, block in enumerate(m.blocks):
             combined = block(combined, tvec, freqs, attention_mask,
                              transformer_options=transformer_options)
+            if _DEBUG['calls'] == 1:
+                _elo_sequence_snapshot(
+                    dump_prefix, f'block{block_index:02d}',
+                    combined, txtlen, tgtlen,
+                )
     if _DEBUG['on'] and _DEBUG['calls'] == 1:
         hits, misses = _DEBUG['lora_hits'], _DEBUG['lora_misses']
         veredito = ('OK' if hits and not misses else
@@ -405,11 +479,26 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
 
     final = m.last(combined, t)
     out = final[:, txtlen:txtlen + tgtlen, :]
+    if _DEBUG['on'] and _DEBUG['calls'] == 1:
+        import os as _os
+        d = _os.environ.get('NODE_DUMP')
+        if d and not _os.path.exists(d + '.x.npy'):
+            import numpy as _np
+            _np.save(d + '.x.npy', x.detach().float().cpu().numpy())
+            _np.save(d + '.ref.npy', ref_latents[0].detach().float().cpu().numpy())
+            _np.save(d + '.ctx.npy', context.detach().float().cpu().numpy())
+            _dbg(f'DUMP node: x/ref/ctx salvos (t={float(timesteps.flatten()[0]):.4f})')
     out = rearrange(out, 'b (h w) (c ph pw) -> b c (h ph) (w pw)',
                     h=h_, w=w_, ph=patch, pw=patch, c=m.channels)
     out = out[:, :, :H_orig, :W_orig]
     if temporal:
         out = out.reshape(b5, t5, m.channels, H_orig, W_orig).movedim(1, 2)
+    if _DEBUG['on'] and _DEBUG['calls'] == 1:
+        import os as _os
+        d = _os.environ.get('NODE_DUMP')
+        if d and not _os.path.exists(d + '.v.npy'):
+            import numpy as _np
+            _np.save(d + '.v.npy', out.detach().float().cpu().numpy())
     return out
 
 
