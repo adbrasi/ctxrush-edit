@@ -40,6 +40,37 @@ uncond exato do treino. Saídas steps/cfg/mu já vêm com os defaults oficiais
 Use o v1 (`CtxRushKrea2OminiGroundedApply`) apenas para os adapters
 `krea2_omini_grounded` antigos (grounding 768 longest-side, layout plain).
 
+## Workflow v2 com paridade e LoRAs adicionais
+
+```text
+UNETLoader (Krea2 raw fp8_scaled, weight_dtype=default)
+  -> K2 Training Base (turbo escolhida aqui)
+  -> [LoraLoaderModelOnly: LoRA Krea2 adicional, opcional]
+  -> [outros LoraLoaderModelOnly compatíveis, opcionais]
+  -> CtxRush - Krea 2 Multi-Ref Grounded (v2)
+  -> guider / sampler
+```
+
+Regras:
+
+- A LoRA **Turbo** pertence exclusivamente ao `K2 Training Base`, que a funde
+  como o runner. Não carregue a mesma Turbo novamente no
+  `LoraLoaderModelOnly`.
+- LoRAs adicionais do diffusion model entram depois do `K2 Training Base` e
+  antes do CtxRush. O mecanismo padrão foi validado em 1024 px: 270 patches
+  permaneceram anexados, enquanto o CtxRush manteve 224/224 chamadas roteadas.
+- A LoRA adicional precisa ter chaves e dimensões compatíveis com Krea2.
+  LoRAs de Flux, SDXL ou outra arquitetura não são intercambiáveis.
+- LoRA de text encoder não faz parte desse teste. Ela requer `LoraLoader`
+  (model + clip) e pesos realmente compatíveis com o Qwen3-VL usado pelo Krea2.
+
+O forward v2 também preserva os hooks `post_input`, `patches_replace` e o
+protocolo `control["output"]` dos DiTs single-stream. Um ControlNet sintético
+passou de ponta a ponta em 1024 px e alterou a saída, sem interferir nas
+224 chamadas do adapter. Isso prova o encanamento do node; não transforma um
+ControlNet de Flux/SDXL em Krea2. É necessário um checkpoint ControlNet
+treinado ou portado para os 6.144 canais e a geometria de tokens do Krea2.
+
 ## Recommended workflow
 
 Use **CtxRush - Krea 2 Edit Setup** for normal work:

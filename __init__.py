@@ -21,4 +21,15 @@ try:
 except Exception as _err:  # pragma: no cover
     print(f'[CtxRush] pack K2 Native indisponivel: {_err!r}')
 
+
+try:
+    from .nodes_trainbase import (
+        NODE_CLASS_MAPPINGS as _TB_CLASSES,
+        NODE_DISPLAY_NAME_MAPPINGS as _TB_NAMES,
+    )
+    NODE_CLASS_MAPPINGS = {**NODE_CLASS_MAPPINGS, **_TB_CLASSES}
+    NODE_DISPLAY_NAME_MAPPINGS = {**NODE_DISPLAY_NAME_MAPPINGS, **_TB_NAMES}
+except Exception as _err:  # pragma: no cover
+    print(f'[CtxRush] K2 Training Base indisponivel: {_err!r}')
+
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

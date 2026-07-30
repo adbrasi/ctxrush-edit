@@ -71,6 +71,66 @@ from .nodes import (
 )
 
 
+def _legacy_llama_attention_forward(
+    self,
+    hidden_states,
+    attention_mask=None,
+    freqs_cis=None,
+    optimized_attention=None,
+    past_key_value=None,
+    sliding_window=None,
+):
+    """Qwen/Llama attention path used by the ComfyUI revision that trained the adapter."""
+    from comfy.text_encoders.llama import apply_rope
+
+    batch_size, seq_length, _ = hidden_states.shape
+    xq = self.q_proj(hidden_states)
+    xk = self.k_proj(hidden_states)
+    xv = self.v_proj(hidden_states)
+    xq = xq.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+    xk = xk.view(batch_size, seq_length, self.num_kv_heads, self.head_dim).transpose(1, 2)
+    xv = xv.view(batch_size, seq_length, self.num_kv_heads, self.head_dim).transpose(1, 2)
+    if self.q_norm is not None:
+        xq = self.q_norm(xq)
+    if self.k_norm is not None:
+        xk = self.k_norm(xk)
+    xq, xk = apply_rope(xq, xk, freqs_cis=freqs_cis)
+
+    present_key_value = None
+    if past_key_value is not None:
+        index = 0
+        num_tokens = xk.shape[2]
+        if len(past_key_value) > 0:
+            past_key, past_value, index = past_key_value
+            if past_key.shape[2] >= index + num_tokens:
+                past_key[:, :, index:index + xk.shape[2]] = xk
+                past_value[:, :, index:index + xv.shape[2]] = xv
+                xk = past_key[:, :, :index + xk.shape[2]]
+                xv = past_value[:, :, :index + xv.shape[2]]
+                present_key_value = (past_key, past_value, index + num_tokens)
+            else:
+                xk = torch.cat((past_key[:, :, :index], xk), dim=2)
+                xv = torch.cat((past_value[:, :, :index], xv), dim=2)
+                present_key_value = (xk, xv, index + num_tokens)
+        else:
+            present_key_value = (xk, xv, index + num_tokens)
+        if sliding_window is not None and xk.shape[2] > sliding_window and seq_length == 1:
+            xk = xk[:, :, -sliding_window:]
+            xv = xv[:, :, -sliding_window:]
+            attention_mask = (
+                attention_mask[..., -sliding_window:]
+                if attention_mask is not None else None
+            )
+
+    xk = xk.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+    xv = xv.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+    output = optimized_attention(
+        xq, xk, xv, self.num_heads,
+        mask=attention_mask, skip_reshape=True,
+    )
+    return self.o_proj(output), present_key_value
+
+
 @contextlib.contextmanager
 def _training_vl_contract(enabled=True):
     """Restaura o contrato de encode de texto/visão sob o qual o adapter treinou.
@@ -99,19 +159,22 @@ def _training_vl_contract(enabled=True):
         return
     try:
         import comfy.text_encoders.qwen3vl as _q3
+        import comfy.text_encoders.llama as _ll
         from comfy.text_encoders.llama import BaseLlama
     except Exception:
         yield
         return
     own = _q3.Qwen3VL.__dict__.get('forward')
-    if own is None:  # ComfyUI já no contrato do treino
-        yield
-        return
-    _q3.Qwen3VL.forward = BaseLlama.forward
+    attention_forward = _ll.Attention.forward
+    if own is not None:
+        _q3.Qwen3VL.forward = BaseLlama.forward
+    _ll.Attention.forward = _legacy_llama_attention_forward
     try:
         yield
     finally:
-        _q3.Qwen3VL.forward = own
+        _ll.Attention.forward = attention_forward
+        if own is not None:
+            _q3.Qwen3VL.forward = own
 
 
 def _read_safetensors_metadata(path):
@@ -234,46 +297,64 @@ def _elo_sequence_snapshot(prefix, name, combined, text_length, target_length,
 
 
 class _TrainingBaseQuant:
-    """Reproduz a base numérica sobre a qual o adapter foi treinado.
+    """VERIFICA (não conserta) se a base carregada é a base de treino.
 
-    O trainer roda com ``diffusion_model_dtype = 'float8'`` e, em
-    ``models/base.py:529-548`` (dequantize), faz ``p.data.to(float8_e4m3fn)``
-    nas Linears 2-D: dequantiza o checkpoint fp8-SCALED e o RE-QUANTIZA para
-    fp8 puro, **sem escala**. Isso degrada os pesos em ~2.8% — e o adapter
-    aprendeu a compensar exatamente essa base.
+    CAUSA RAIZ nº1 do gap node-vs-runner, medida com x_T/contexto/referência
+    pareados no 1º forward (dumps em /workspace/outputs/node_test/):
 
-    O ComfyUI carrega o mesmo checkpoint em bf16 (0.0016% de erro), ou seja,
-    uma base ~2.8% diferente da de treino. Medido pelos auditores: o efeito do
-    adapter fica **13% mais fraco** no ComfyUI por causa disso.
+        node com fp8_scaled + LoraLoaderModelOnly   v relL2 = 0.58090
+        node com a base assada (scripts/bake_...)   v relL2 = 0.03116
+        (efeito TOTAL do adapter no v, p/ escala:   relL2 ~ 0.38)
 
-    Aplicado **in-place e uma única vez** por módulo: com "dynamic VRAM
-    loading" os pesos vivem em CPU até o forward original os mover, então
-    interceptar a Linear para quantizar na hora causaria transferência por
-    chamada. A operação é idempotente (quantizar duas vezes dá o mesmo
-    resultado), e o resultado É a base de treino — não há o que "restaurar".
-    Recarregar o modelo no ComfyUI desfaz.
+    O trainer roda com ``diffusion_model_dtype = 'float8'``
+    (train.toml:34) e em ``models/base.py:536,547`` DESCARTA o
+    ``weight_scale`` do checkpoint fp8_scaled, re-quantizando as 224 Linears
+    de ``blocks.*`` no grid fp8 CRU (2.5%–6.7% de erro por matriz, até 26%
+    dos pesos zerados). Depois ``apply_turbo_lora`` soma a turbo e
+    re-quantiza de novo. O adapter aprendeu a compensar ESSA base.
+
+    A versão anterior desta classe tentava consertar in-place com
+    ``w.data.to(fp8).to(w.dtype)``. Isso é um **no-op algébrico**: os pesos
+    são ``comfy_kitchen.tensor.base.QuantizedTensor`` e ``_handle_to``
+    (comfy_kitchen/tensor/base.py:417-436, linha 430) só reescreve o rótulo
+    ``orig_dtype`` — ``torch.equal(depois, antes) == True``, relL2 0.0.
+
+    O conserto correto é assar o checkpoint uma vez (ver
+    ``scripts/bake_training_base.py``), o que reproduz os pesos do runner
+    BIT A BIT. Aqui só avisamos quando a base carregada não é aquela.
     """
 
-    _done = set()
+    _checked = set()
 
     def __init__(self, entries):
         self.modules = [e[0] for e in entries]
 
     def __enter__(self):
-        n = 0
-        for module in self.modules:
+        for module in self.modules[:4]:
             key = id(module)
-            if key in _TrainingBaseQuant._done:
+            if key in _TrainingBaseQuant._checked:
                 continue
+            _TrainingBaseQuant._checked.add(key)
             w = getattr(module, 'weight', None)
-            if w is None or w.ndim != 2:
+            if w is None or getattr(w, 'ndim', 0) != 2:
                 continue
-            w.data = w.data.to(torch.float8_e4m3fn).to(w.data.dtype)
-            _TrainingBaseQuant._done.add(key)
-            n += 1
-        if n:
-            _dbg(f'base quantizada para fp8 (contrato de treino) em {n} Linears '
-                 f'(in-place, idempotente; recarregue o modelo para desfazer)')
+            try:
+                full = w.dequantize() if hasattr(w, 'dequantize') else w.data
+                sl = full[:128, :128].float()
+                erro = (sl.to(torch.float8_e4m3fn).float() - sl).norm() / sl.norm().clamp_min(1e-12)
+            except Exception as exc:                      # pragma: no cover
+                _dbg(f'base: nao consegui inspecionar os pesos ({exc})')
+                continue
+            if float(erro) > 1e-6:
+                _dbg('AVISO: a base carregada NAO esta no grid fp8 do treino '
+                     f'(erro de quantizacao residual {float(erro) * 100:.2f}% > 0). '
+                     'O adapter foi treinado sobre pesos fp8_e4m3fn SEM escala '
+                     '(train.toml diffusion_model_dtype=float8). Rode '
+                     'scripts/bake_training_base.py e carregue o .safetensors '
+                     'assado no UNETLoader, SEM LoraLoaderModelOnly (a turbo ja '
+                     'vai fundida). Medido: v relL2 0.581 -> 0.031.')
+            else:
+                _dbg('base OK: pesos no grid fp8 do treino.')
         return self
 
     def __exit__(self, *exc):
@@ -315,19 +396,25 @@ class _CountingMaskedLoraScope(_MaskedLoraScope):
 def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
                             fusion_entries, strength, transformer_options,
                             fusion_strength, reference_timestep, slot_axis,
-                            position_offset, text_attention_mask=None, training_base_quant=False):
+                            position_offset, text_attention_mask=None,
+                            training_base_quant=False, control=None):
     """Espelho fiel de Krea2MultiRefInitialLayer.forward (o que treinou):
     N spans concatenados após o target, offset RoPE cumulativo por slot,
     t=0 (ou target) per-token nos spans, txtfusion antes do txtmlp."""
     import os as _os_probe
+    transformer_options = (transformer_options or {}).copy()
     dump_prefix = _os_probe.environ.get('NODE_DUMP')
     source_prefix = _os_probe.environ.get('NODE_BISECT_SOURCE')
     if source_prefix:
         import numpy as _np_probe
-        raw_context = torch.from_numpy(_np_probe.load(source_prefix + '.cond0.npy'))
-        context = raw_context.to(device=context.device, dtype=context.dtype)
-        raw_reference = torch.from_numpy(_np_probe.load(source_prefix + '.ref.npy'))
-        ref_latents = [raw_reference]
+        override_context = _os_probe.environ.get('NODE_BISECT_CONTEXT', '1') != '0'
+        override_reference = _os_probe.environ.get('NODE_BISECT_REFERENCE', '1') != '0'
+        if override_context:
+            raw_context = torch.from_numpy(_np_probe.load(source_prefix + '.cond0.npy'))
+            context = raw_context.to(device=context.device, dtype=context.dtype)
+        if override_reference:
+            raw_reference = torch.from_numpy(_np_probe.load(source_prefix + '.ref.npy'))
+            ref_latents = [raw_reference]
     temporal = x.ndim == 5
     if temporal:
         b5, c5, t5, h5, w5 = x.shape
@@ -345,7 +432,7 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
     _elo_save(dump_prefix, 'target_tokens', tgt)
 
     # --- N spans de referência, offset cumulativo -------------------------
-    ref_tokens_list, ref_pos_list = [], []
+    ref_tokens_list, ref_pos_list, ref_token_lengths = [], [], []
     width_cursor = float(w_)
     for slot, src in enumerate(ref_latents):
         if src.ndim == 5:
@@ -358,6 +445,7 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
         ref_tokens_list.append(m.first(
             rearrange(src, 'b c (h ph) (w pw) -> b (h w) (c ph pw)', ph=patch, pw=patch)
         ))
+        ref_token_lengths.append(grid_h * grid_w)
         pos = torch.zeros(grid_h, grid_w, 3, device=device, dtype=torch.float32)
         pos[..., 1] = torch.arange(grid_h, device=device, dtype=torch.float32)[:, None]
         pos[..., 2] = torch.arange(grid_w, device=device, dtype=torch.float32)[None, :]
@@ -373,8 +461,13 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
     _elo_save(dump_prefix, 'reference_input', ref_latents[0])
     _elo_save(dump_prefix, 'reference_tokens', ref)
 
+    # O runner calcula duas coisas distintas:
+    #   1. o embedding escalar do timestep do target, usado pela camada final;
+    #   2. tmlp+tproj sobre TODOS os timesteps por token numa unica chamada.
+    # Expandir um tvec calculado com shape (B, 1, D) e matematicamente
+    # equivalente, mas escolhe outro kernel GEMM BF16 e diverge numericamente
+    # do treino ao longo dos 28 blocos.
     t = m.tmlp(timestep_embedding(timesteps, m.tdim).unsqueeze(1).to(tgt.dtype))
-    tvec_t = m.tproj(t)
 
     fusion_scale = strength if fusion_strength is None else fusion_strength
     use_fusion = bool(fusion_entries) and fusion_scale > 0
@@ -385,24 +478,55 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
     _elo_save(dump_prefix, 'context_txtmlp', context)
 
     txtlen, tgtlen, reflen = context.shape[1], tgt.shape[1], ref.shape[1]
-    combined = torch.cat([context, tgt, ref], dim=1)
-
-    if reference_timestep == 'target':
-        ref_tvec = tvec_t
-    else:
-        t0 = m.tmlp(timestep_embedding(torch.zeros_like(timesteps), m.tdim).unsqueeze(1).to(tgt.dtype))
-        ref_tvec = m.tproj(t0)
-    tvec = torch.cat([
-        tvec_t.expand(-1, txtlen + tgtlen, -1),
-        ref_tvec.expand(-1, reflen, -1),
-    ], dim=1)
 
     txtpos = torch.zeros(bs, txtlen, 3, device=device, dtype=torch.float32)
     grid = torch.zeros(h_, w_, 3, device=device, dtype=torch.float32)
     grid[..., 1] = torch.arange(h_, device=device, dtype=torch.float32)[:, None]
     grid[..., 2] = torch.arange(w_, device=device, dtype=torch.float32)[None, :]
     tgtpos = grid.reshape(1, h_ * w_, 3).repeat(bs, 1, 1)
-    freqs = m.pe_embedder(torch.cat([txtpos, tgtpos, refpos], dim=1))
+    img = torch.cat([tgt, ref], dim=1)
+    imgpos = torch.cat([tgtpos, refpos], dim=1)
+
+    # Preserva o protocolo de patches do ComfyUI. IP-Adapters e outros model
+    # patches usam `post_input` para alterar os tokens já projetados. Como o
+    # roteamento da nossa LoRA depende da fronteira target/ref, recusamos
+    # silenciosamente perigosa mudança de comprimento.
+    transformer_options["reference_image_num_tokens"] = ref_token_lengths
+    patches = transformer_options.get("patches", {})
+    if "post_input" in patches:
+        for patch_fn in patches["post_input"]:
+            patched_input = patch_fn({
+                "img": img,
+                "txt": context,
+                "img_ids": imgpos,
+                "txt_ids": txtpos,
+                "transformer_options": transformer_options,
+            })
+            img = patched_input["img"]
+            context = patched_input["txt"]
+            imgpos = patched_input["img_ids"]
+            txtpos = patched_input["txt_ids"]
+        if context.shape[1] != txtlen or img.shape[1] != tgtlen + reflen:
+            raise RuntimeError(
+                "Um model patch alterou a quantidade de tokens do Krea2. "
+                "CtxRush precisa preservar as fronteiras texto/target/referencia "
+                "para rotear a LoRA condition-only com seguranca."
+            )
+
+    combined = torch.cat([context, img], dim=1)
+
+    target_timesteps = timesteps[:, None].expand(bs, txtlen + tgtlen)
+    if reference_timestep == 'target':
+        reference_timesteps = timesteps[:, None].expand(bs, reflen)
+    else:
+        reference_timesteps = timesteps.new_zeros(bs, reflen)
+    per_token_timesteps = torch.cat([target_timesteps, reference_timesteps], dim=1)
+    embedded_timesteps = timestep_embedding(
+        per_token_timesteps.reshape(-1), m.tdim
+    ).reshape(bs, combined.shape[1], m.tdim)
+    tvec = m.tproj(m.tmlp(embedded_timesteps.to(combined.dtype)))
+
+    freqs = m.pe_embedder(torch.cat([txtpos, imgpos], dim=1))
 
     entries = blocks_state['entries']
     if blocks_state.get('device') != device:
@@ -460,11 +584,61 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
              f'chaves validas={int(attention_mask.sum())}/{seq_len} '
              f'(texto {int(text_valid.sum())}/{txtlen}) | origem={origem}')
 
-    quant_ctx = _TrainingBaseQuant(entries) if training_base_quant else _NullScope()
+    quant_ctx = (_TrainingBaseQuant(entries)
+                 if (training_base_quant and _DEBUG['calls'] == 1) else _NullScope())
+    blocks_replace = transformer_options.get("patches_replace", {}).get("dit", {})
+    transformer_options["total_blocks"] = len(m.blocks)
+    transformer_options["block_type"] = "single"
+    transformer_options["img_slice"] = [txtlen, combined.shape[1]]
+    control_hits = 0
     with quant_ctx, _CountingMaskedLoraScope(entries, txtlen + tgtlen, seq_len, seq_len, strength):
         for block_index, block in enumerate(m.blocks):
-            combined = block(combined, tvec, freqs, attention_mask,
-                             transformer_options=transformer_options)
+            transformer_options["block_index"] = block_index
+            replace = blocks_replace.get(("single_block", block_index))
+            if replace is not None:
+                def block_wrap(args, _block=block):
+                    return {"img": _block(
+                        args["img"],
+                        args["vec"],
+                        args["pe"],
+                        args.get("attn_mask"),
+                        transformer_options=args.get("transformer_options", {}),
+                    )}
+
+                replaced = replace({
+                    "img": combined,
+                    "vec": tvec,
+                    "pe": freqs,
+                    "attn_mask": attention_mask,
+                    "transformer_options": transformer_options,
+                }, {"original_block": block_wrap})
+                combined = replaced["img"]
+            else:
+                combined = block(
+                    combined, tvec, freqs, attention_mask,
+                    transformer_options=transformer_options,
+                )
+
+            # Protocolo padrão dos ControlNets de DiT single-stream. Só o
+            # target recebe o residual; texto e referência limpa permanecem
+            # intactos. Isto torna o forward compatível com um ControlNet que
+            # realmente tenha sido treinado para hidden-size/tokens do Krea2.
+            if control is not None:
+                control_out = control.get("output") if isinstance(control, dict) else None
+                if control_out is not None and block_index < len(control_out):
+                    add = control_out[block_index]
+                    if add is not None:
+                        add = add.to(device=combined.device, dtype=combined.dtype)
+                        if add.shape[0] != combined.shape[0]:
+                            add = comfy.utils.repeat_to_batch_size(add, combined.shape[0])
+                        if add.shape[-1] != combined.shape[-1]:
+                            raise RuntimeError(
+                                "ControlNet incompativel com Krea2: hidden size "
+                                f"{add.shape[-1]} != {combined.shape[-1]}."
+                            )
+                        token_count = min(tgtlen, add.shape[1])
+                        combined[:, txtlen:txtlen + token_count] += add[:, :token_count]
+                        control_hits += 1
             if _DEBUG['calls'] == 1:
                 _elo_sequence_snapshot(
                     dump_prefix, f'block{block_index:02d}',
@@ -476,6 +650,8 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
                     'PARCIAL — alguma chamada nao casou seq_len' if hits else
                     'FALHA: o delta da LoRA NAO foi aplicado em nenhuma chamada')
         _dbg(f'LoRA routada aplicada em {hits} chamadas, ignorada em {misses} -> {veredito}')
+        if control is not None:
+            _dbg(f'ControlNet residual aplicado em {control_hits} blocos')
 
     final = m.last(combined, t)
     out = final[:, txtlen:txtlen + tgtlen, :]
@@ -511,7 +687,10 @@ class CtxRushKrea2MultiRefApply:
     def INPUT_TYPES(cls):
         return {
             'required': {
-                'model': ('MODEL', {'tooltip': 'Krea 2 SEM Load LoRA (adapter aplicado em runtime bf16).'}),
+                'model': ('MODEL', {'tooltip': 'Saida do K2 Training Base. LoRAs adicionais '
+                                               'compativeis com Krea2 podem passar antes por '
+                                               'LoraLoaderModelOnly; nao carregue a turbo de novo. '
+                                               'O adapter CtxRush e aplicado aqui em runtime bf16.'}),
                 'clip': ('CLIP', {'tooltip': 'Krea 2 Qwen3-VL com torre visual.'}),
                 'vae': ('VAE',),
                 'image_1': ('IMAGE', {'tooltip': 'Referência 1 (slot que "image 1" endereça).'}),
@@ -557,13 +736,15 @@ class CtxRushKrea2MultiRefApply:
                                      'referencia) recebe uma distribuicao fora da de treino e a '
                                      'identidade do personagem nao e preservada — "parecido, nao o '
                                      'mesmo". Desligue so para adapters treinados com ComfyUI novo.'}),
-                'training_base_quant': ('BOOLEAN', {'default': False,
-                          'tooltip': 'Reproduz a base numerica do treino: o trainer roda com '
-                                     'diffusion_model_dtype=float8 e re-quantiza os pesos das '
-                                     'Linears para fp8 puro SEM escala (degradacao ~2.8%). O '
-                                     'ComfyUI carrega em bf16, deixando o efeito do adapter ~13% '
-                                     'mais fraco. Ligue se ainda faltar fidelidade. Custa tempo '
-                                     'de forward (quantiza na hora, sem cache).'}),
+                'training_base_quant': ('BOOLEAN', {'default': True,
+                          'tooltip': 'VERIFICA (nao conserta) se a base carregada e a base de '
+                                     'treino. O trainer roda com diffusion_model_dtype=float8 e '
+                                     're-quantiza as 224 Linears de blocks.* no grid fp8 SEM '
+                                     'escala; o adapter aprendeu sobre esses pesos. Carregar o '
+                                     'fp8_scaled normal + LoraLoaderModelOnly da v relL2 0.581 '
+                                     'contra o runner; a base assada por '
+                                     'scripts/bake_training_base.py da 0.031. Deixe ligado: so '
+                                     'imprime um aviso no 1o forward se a base estiver errada.'}),
                 'debug': ('BOOLEAN', {'default': False,
                           'tooltip': 'Loga no console TUDO que define o resultado: hashes e dtypes dos '
                                      'modelos, contrato lido da metadata, prompt VL literal, geometria da '
@@ -591,7 +772,7 @@ class CtxRushKrea2MultiRefApply:
               reference_noise=0.0, start_percent=0.0, end_percent=1.0,
               strength_curve='constant', curve_power=1.0,
               layers='all', layer_taper='flat', training_vl_contract=True,
-              training_base_quant=False, debug=False):
+              training_base_quant=True, debug=False):
         _DEBUG.update(on=bool(debug), calls=0, lora_hits=0, lora_misses=0, logged=False)
         lora_path = folder_paths.get_full_path('loras', lora_name)
         metadata = _read_safetensors_metadata(lora_path)
@@ -707,7 +888,7 @@ class CtxRushKrea2MultiRefApply:
                     _dbg(f'contexto do encode: shape={tuple(t0.shape)} '
                          f'norm={t0.float().norm():.2f} std={t0.float().std():.5f} '
                          f'| contrato_treino={"ON" if training_vl_contract else "OFF"} '
-                         f'(referencia do treino: norm~15813 std~6.94; '
+                         f'(ALVO medido no runner: norm~16489 std~6.358; '
                          f'ComfyUI novo sem o fix: norm~17178 std~7.54)')
                 except Exception:
                     pass
@@ -783,6 +964,7 @@ class CtxRushKrea2MultiRefApply:
                 position_offset=contract['position_offset'],
                 text_attention_mask=text_mask,
                 training_base_quant=training_base_quant,
+                control=kwargs.get('control'),
             )
 
         to = patched.model_options.setdefault('transformer_options', {})
