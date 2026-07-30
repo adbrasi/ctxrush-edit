@@ -27,6 +27,19 @@ ComfyUI/
 
 The Qwen3-VL text encoder checkpoint must include its `visual.*` weights.
 
+## v2 — Multi-Ref Grounded (`CtxRush - Krea 2 Multi-Ref Grounded (v2)`)
+
+Para adapters `krea2_multiref_grounded` (ex.: k2-context-rush-ofc-beta1).
+O node lê o contrato da **metadata do próprio adapter** (grounding 384² por
+área, vision blocks `image 1:`, refs a t=0, width-shift cumulativo) — os
+dials manuais são só override. Aceita até 4 referências; com N>1, enderece
+no prompt como `image 1` / `image 2` (sem `<>`). Negative vazio reproduz o
+uncond exato do treino. Saídas steps/cfg/mu já vêm com os defaults oficiais
+(raw 28/5.5/mu-por-resolução; turbo 8/1.0/1.15).
+
+Use o v1 (`CtxRushKrea2OminiGroundedApply`) apenas para os adapters
+`krea2_omini_grounded` antigos (grounding 768 longest-side, layout plain).
+
 ## Recommended workflow
 
 Use **CtxRush - Krea 2 Edit Setup** for normal work:
