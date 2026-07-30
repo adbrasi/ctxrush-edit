@@ -185,6 +185,53 @@ def _tensor_stats(name, t):
         return f'{name}: <stats falhou: {e!r}>'
 
 
+class _TrainingBaseQuant:
+    """Reproduz a base numérica sobre a qual o adapter foi treinado.
+
+    O trainer roda com ``diffusion_model_dtype = 'float8'`` e, em
+    ``models/base.py:529-548`` (dequantize), faz ``p.data.to(float8_e4m3fn)``
+    nas Linears 2-D: dequantiza o checkpoint fp8-SCALED e o RE-QUANTIZA para
+    fp8 puro, **sem escala**. Isso degrada os pesos em ~2.8% — e o adapter
+    aprendeu a compensar exatamente essa base.
+
+    O ComfyUI carrega o mesmo checkpoint em bf16 (0.0016% de erro), ou seja,
+    uma base ~2.8% diferente da de treino. Medido pelos auditores: o efeito do
+    adapter fica **13% mais fraco** no ComfyUI por causa disso.
+
+    Aplicado **in-place e uma única vez** por módulo: com "dynamic VRAM
+    loading" os pesos vivem em CPU até o forward original os mover, então
+    interceptar a Linear para quantizar na hora causaria transferência por
+    chamada. A operação é idempotente (quantizar duas vezes dá o mesmo
+    resultado), e o resultado É a base de treino — não há o que "restaurar".
+    Recarregar o modelo no ComfyUI desfaz.
+    """
+
+    _done = set()
+
+    def __init__(self, entries):
+        self.modules = [e[0] for e in entries]
+
+    def __enter__(self):
+        n = 0
+        for module in self.modules:
+            key = id(module)
+            if key in _TrainingBaseQuant._done:
+                continue
+            w = getattr(module, 'weight', None)
+            if w is None or w.ndim != 2:
+                continue
+            w.data = w.data.to(torch.float8_e4m3fn).to(w.data.dtype)
+            _TrainingBaseQuant._done.add(key)
+            n += 1
+        if n:
+            _dbg(f'base quantizada para fp8 (contrato de treino) em {n} Linears '
+                 f'(in-place, idempotente; recarregue o modelo para desfazer)')
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 class _CountingMaskedLoraScope(_MaskedLoraScope):
     """Igual ao original, mas conta quantas chamadas realmente aplicaram o
     delta e quantas passaram batido pela guarda de seq_len. Se `aplicado` for
@@ -220,7 +267,7 @@ class _CountingMaskedLoraScope(_MaskedLoraScope):
 def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
                             fusion_entries, strength, transformer_options,
                             fusion_strength, reference_timestep, slot_axis,
-                            position_offset, text_attention_mask=None):
+                            position_offset, text_attention_mask=None, training_base_quant=False):
     """Espelho fiel de Krea2MultiRefInitialLayer.forward (o que treinou):
     N spans concatenados após o target, offset RoPE cumulativo por slot,
     t=0 (ou target) per-token nos spans, txtfusion antes do txtmlp."""
@@ -344,7 +391,8 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
              f'chaves validas={int(attention_mask.sum())}/{seq_len} '
              f'(texto {int(text_valid.sum())}/{txtlen}) | origem={origem}')
 
-    with _CountingMaskedLoraScope(entries, txtlen + tgtlen, seq_len, seq_len, strength):
+    quant_ctx = _TrainingBaseQuant(entries) if training_base_quant else _NullScope()
+    with quant_ctx, _CountingMaskedLoraScope(entries, txtlen + tgtlen, seq_len, seq_len, strength):
         for block in m.blocks:
             combined = block(combined, tvec, freqs, attention_mask,
                              transformer_options=transformer_options)
@@ -420,6 +468,13 @@ class CtxRushKrea2MultiRefApply:
                                      'referencia) recebe uma distribuicao fora da de treino e a '
                                      'identidade do personagem nao e preservada — "parecido, nao o '
                                      'mesmo". Desligue so para adapters treinados com ComfyUI novo.'}),
+                'training_base_quant': ('BOOLEAN', {'default': False,
+                          'tooltip': 'Reproduz a base numerica do treino: o trainer roda com '
+                                     'diffusion_model_dtype=float8 e re-quantiza os pesos das '
+                                     'Linears para fp8 puro SEM escala (degradacao ~2.8%). O '
+                                     'ComfyUI carrega em bf16, deixando o efeito do adapter ~13% '
+                                     'mais fraco. Ligue se ainda faltar fidelidade. Custa tempo '
+                                     'de forward (quantiza na hora, sem cache).'}),
                 'debug': ('BOOLEAN', {'default': False,
                           'tooltip': 'Loga no console TUDO que define o resultado: hashes e dtypes dos '
                                      'modelos, contrato lido da metadata, prompt VL literal, geometria da '
@@ -446,7 +501,8 @@ class CtxRushKrea2MultiRefApply:
               reference_timestep='auto', negative_grounding='grounded',
               reference_noise=0.0, start_percent=0.0, end_percent=1.0,
               strength_curve='constant', curve_power=1.0,
-              layers='all', layer_taper='flat', training_vl_contract=True, debug=False):
+              layers='all', layer_taper='flat', training_vl_contract=True,
+              training_base_quant=False, debug=False):
         _DEBUG.update(on=bool(debug), calls=0, lora_hits=0, lora_misses=0, logged=False)
         lora_path = folder_paths.get_full_path('loras', lora_name)
         metadata = _read_safetensors_metadata(lora_path)
@@ -637,6 +693,7 @@ class CtxRushKrea2MultiRefApply:
                 slot_axis=contract['slot_axis'],
                 position_offset=contract['position_offset'],
                 text_attention_mask=text_mask,
+                training_base_quant=training_base_quant,
             )
 
         to = patched.model_options.setdefault('transformer_options', {})
