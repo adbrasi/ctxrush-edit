@@ -117,6 +117,62 @@ def _build_vl_prompt(num_images, prompt, style, label):
     return ''.join(f'{label} {i + 1}: {VISION_BLOCK}' for i in range(num_images)) + prompt
 
 
+# --- DEBUG -----------------------------------------------------------------
+# O modo de falha caro deste node é SILENCIOSO: o adapter carrega, o forward
+# roda, a imagem sai — e o delta simplesmente não chegou aos tokens certos.
+# Nesse caso a saída fica "parecida com a referência" em vez de idêntica, que
+# é indistinguível de adapter fraco ou de prompt ruim. O debug abaixo torna
+# cada elo verificável no console.
+_DEBUG = {'on': False, 'calls': 0, 'lora_hits': 0, 'lora_misses': 0, 'logged': False}
+
+
+def _dbg(msg):
+    if _DEBUG['on']:
+        print(f'[MultiRef][debug] {msg}', flush=True)
+
+
+def _tensor_stats(name, t):
+    try:
+        f = t.detach().float()
+        return (f'{name}: shape={tuple(t.shape)} dtype={t.dtype} dev={t.device} '
+                f'min={f.min():.4f} max={f.max():.4f} mean={f.mean():.4f} std={f.std():.4f} '
+                f'nan={int(torch.isnan(f).sum())}')
+    except Exception as e:  # pragma: no cover
+        return f'{name}: <stats falhou: {e!r}>'
+
+
+class _CountingMaskedLoraScope(_MaskedLoraScope):
+    """Igual ao original, mas conta quantas chamadas realmente aplicaram o
+    delta e quantas passaram batido pela guarda de seq_len. Se `aplicado` for
+    0, a LoRA routada NÃO está agindo — a causa nº1 de 'parece mas não é'."""
+
+    def __enter__(self):
+        s, e = self.span
+        seq_len, scale = self.seq_len, self.scale
+        for entry in self.entries:
+            module, lora_a, lora_b = entry[:3]
+            entry_scale = entry[3] if len(entry) > 3 else 1.0
+            orig = module.forward
+
+            def wrapped(x, *args, _orig=orig, _a=lora_a, _b=lora_b,
+                        _entry_scale=entry_scale, **kwargs):
+                out = _orig(x, *args, **kwargs)
+                if x.ndim >= 3 and x.shape[-2] == seq_len:
+                    piece = x[..., s:e, :].to(_a.dtype)
+                    delta = torch.nn.functional.linear(
+                        torch.nn.functional.linear(piece, _a), _b)
+                    out[..., s:e, :] += (delta * scale * _entry_scale).to(out.dtype)
+                    _DEBUG['lora_hits'] += 1
+                else:
+                    _DEBUG['lora_misses'] += 1
+                return out
+
+            self._originals.append((module, orig))
+            module.forward = wrapped
+        return self
+# ---------------------------------------------------------------------------
+
+
 def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
                             fusion_entries, strength, transformer_options,
                             fusion_strength, reference_timestep, slot_axis,
@@ -204,9 +260,30 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
         blocks_state['device'] = device
 
     seq_len = txtlen + tgtlen + reflen
-    with _MaskedLoraScope(entries, txtlen + tgtlen, seq_len, seq_len, strength):
+    _DEBUG['calls'] += 1
+    if _DEBUG['on'] and not _DEBUG['logged']:
+        _DEBUG['logged'] = True
+        _dbg(f'--- forward #1 (os demais steps sao iguais) ---')
+        _dbg(f'sequencia: texto={txtlen} target={tgtlen} refs={reflen} total={seq_len} '
+             f'| grid target={h_}x{w_} | refs={len(ref_latents)} | batch={bs}')
+        _dbg(f'span da LoRA routada: [{txtlen + tgtlen}, {seq_len}) '
+             f'= exatamente os {reflen} tokens de referencia')
+        _dbg(f'RoPE: target w=[0,{w_}) | ref w=[{w_},{int(refpos[..., 2].max()) + 1}) '
+             f'| eixo frame ref={float(refpos[..., 0].max()):.0f} | slot_axis={slot_axis}')
+        _dbg(f'timestep ref={reference_timestep} (sigma do step={float(timesteps.flatten()[0]):.4f})')
+        _dbg(_tensor_stats('latente da referencia', ref_latents[0]))
+        _dbg(_tensor_stats('contexto de texto (pos txtfusion)', context))
+        _dbg(f'strength: blocks={strength} txtfusion={fusion_scale} '
+             f'| entries: {len(entries)} blocks, {len(fusion_entries)} txtfusion')
+    with _CountingMaskedLoraScope(entries, txtlen + tgtlen, seq_len, seq_len, strength):
         for block in m.blocks:
             combined = block(combined, tvec, freqs, None, transformer_options=transformer_options)
+    if _DEBUG['on'] and _DEBUG['calls'] == 1:
+        hits, misses = _DEBUG['lora_hits'], _DEBUG['lora_misses']
+        veredito = ('OK' if hits and not misses else
+                    'PARCIAL — alguma chamada nao casou seq_len' if hits else
+                    'FALHA: o delta da LoRA NAO foi aplicado em nenhuma chamada')
+        _dbg(f'LoRA routada aplicada em {hits} chamadas, ignorada em {misses} -> {veredito}')
 
     final = m.last(combined, t)
     out = final[:, txtlen:txtlen + tgtlen, :]
@@ -266,6 +343,11 @@ class CtxRushKrea2MultiRefApply:
                 'curve_power': ('FLOAT', {'default': 1.0, 'min': 0.1, 'max': 4.0, 'step': 0.1}),
                 'layers': ('STRING', {'default': 'all', 'tooltip': "'all' ou faixa 'inicio-fim' (0-27)."}),
                 'layer_taper': (['flat', 'fade_deep', 'fade_shallow'], {'default': 'flat'}),
+                'debug': ('BOOLEAN', {'default': False,
+                          'tooltip': 'Loga no console TUDO que define o resultado: hashes e dtypes dos '
+                                     'modelos, contrato lido da metadata, prompt VL literal, geometria da '
+                                     'sequencia, span da LoRA e — o mais importante — se o delta routado '
+                                     'foi de fato aplicado. Ligue quando a saida "parecer" mas nao for.'}),
             },
         }
 
@@ -287,10 +369,41 @@ class CtxRushKrea2MultiRefApply:
               reference_timestep='auto', negative_grounding='grounded',
               reference_noise=0.0, start_percent=0.0, end_percent=1.0,
               strength_curve='constant', curve_power=1.0,
-              layers='all', layer_taper='flat'):
+              layers='all', layer_taper='flat', debug=False):
+        _DEBUG.update(on=bool(debug), calls=0, lora_hits=0, lora_misses=0, logged=False)
         lora_path = folder_paths.get_full_path('loras', lora_name)
         metadata = _read_safetensors_metadata(lora_path)
         contract = _resolve_contract(metadata, vl_max_pixels, vl_image_label, reference_timestep)
+
+        if debug:
+            import hashlib
+            import os
+            _dbg('=' * 62)
+            try:
+                with open(lora_path, 'rb') as f:
+                    head = hashlib.sha256(f.read(8 << 20)).hexdigest()[:16]
+                size_mb = os.path.getsize(lora_path) / 2**20
+            except Exception as e:
+                head, size_mb = f'<{e!r}>', -1
+            _dbg(f'adapter: {os.path.basename(lora_path)} ({size_mb:.0f} MB, sha256[8MB]={head})')
+            _dbg(f'metadata do adapter: ' + ', '.join(
+                f'{k}={v}' for k, v in sorted(metadata.items())
+                if k in ('control_family', 'model_type', 'position_mode', 'slot_axis',
+                         'max_refs', 'reference_model_timestep', 'vl_image_max_pixels',
+                         'vl_prompt_layout', 'caption_dropout', 'lora_targets',
+                         'diffusion_pipe_commit', 'base_model_file')) or '<VAZIA>')
+            if not metadata:
+                _dbg('AVISO: adapter sem metadata — o contrato caiu nos defaults. '
+                     'Confira se este safetensors saiu deste trainer.')
+            try:
+                dm = model.model.diffusion_model
+                dts = {}
+                for p in dm.parameters():
+                    dts[str(p.dtype)] = dts.get(str(p.dtype), 0) + 1
+                _dbg(f'base DiT: {type(dm).__name__} | dtypes={dts}')
+            except Exception as e:
+                _dbg(f'base DiT: <inspecao falhou: {e!r}>')
+            _dbg(f'contrato efetivo: {contract}')
 
         if contract['family'] and contract['family'] != 'krea2_multiref_grounded':
             print(f"[MultiRef] WARNING: adapter é '{contract['family']}', não "
@@ -320,8 +433,22 @@ class CtxRushKrea2MultiRefApply:
                 return clip.encode_from_tokens_scheduled(tokens)
             text = _build_vl_prompt(len(vl_images), prompt,
                                     contract['prompt_style'], contract['vl_label'])
+            if debug:
+                shown = text.replace(VISION_BLOCK, '<VIS>')
+                _dbg(f'prompt VL enviado ao Qwen3-VL ({len(text)} chars): '
+                     f'{shown[:300]}{"…" if len(shown) > 300 else ""}')
             tokens = clip.tokenize(text, images=vl_images, llama_template=KREA2_TEMPLATE)
             return clip.encode_from_tokens_scheduled(tokens)
+
+        if debug:
+            for i, (im, lat) in enumerate(zip(vl_images, ref_latents)):
+                _dbg(_tensor_stats(f'ref{i+1} vista pelo Qwen3-VL (px)', im))
+                _dbg(_tensor_stats(f'ref{i+1} latente VAE', lat))
+            _dbg(f'geracao: {width}x{height} | variante={model_variant} | '
+                 f'mu={_krea2_raw_mu(width, height) if model_variant == "raw" else KREA2_TURBO_MU:.6f}')
+            _dbg('LEMBRETE: no KSampler use sampler=euler e scheduler=simple (ou '
+                 'sgm_uniform). karras/exponential/normal usam outro grid de sigmas e '
+                 'lavam a identidade da referencia.')
 
         positive = encode(positive_prompt)
         negative = encode(negative_prompt, grounded=(negative_grounding == 'grounded'))
