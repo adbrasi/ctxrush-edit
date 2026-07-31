@@ -27,6 +27,27 @@ ComfyUI/
 
 The Qwen3-VL text encoder checkpoint must include its `visual.*` weights.
 
+## K2 Prompt Rewriter (`K2 Prompt Rewriter (system + pedido)`)
+
+Monta as duas strings que um node de LLM precisa para reescrever o seu pedido
+no dialeto certo. Não chama LLM nenhum — só entrega texto.
+
+- **`dialeto`**: menu de 11 tipos (EDIT, NEXT, PANEL, CTX, POSE, EXPRESSION,
+  OBJECT, STYLE, BACKGROUND, CROP, INSCENE), com o número de exemplos de
+  treino de cada um ao lado.
+- **`pedido`**: escreva em português mesmo.
+- **saídas**: `system_prompt` e `user_prompt` (`TYPE: <n>` + `REQUEST: <pedido>`).
+
+Ligue as duas nas entradas equivalentes do seu node de LLM. A resposta vem como
+um único objeto JSON — extraia a chave `prompt_final` antes de mandar para o
+`CLIPTextEncode`.
+
+**Por que existe:** o adapter foi treinado em 30.000 captions que não são um
+estilo só, e sim 11 dialetos com gramáticas de superfície distintas. Um pedido
+em português corrido não se parece com nenhum deles, e o modelo responde pior.
+O system prompt fica em `prompts/rewriter_manual_dialect.md`; a versão com
+roteamento automático (sem seletor) está em `prompts/rewriter_auto_router.md`.
+
 ## v2 — Multi-Ref Grounded (`CtxRush - Krea 2 Multi-Ref Grounded (v2)`)
 
 Para adapters `krea2_multiref_grounded` (ex.: k2-context-rush-ofc-beta1).

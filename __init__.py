@@ -55,4 +55,15 @@ except Exception as _err:  # pragma: no cover
     print(f'[CtxRush] K2 Reference Control indisponivel: {_err!r}')
 
 
+try:
+    from .nodes_prompt_rewriter import (
+        NODE_CLASS_MAPPINGS as _PR_CLASSES,
+        NODE_DISPLAY_NAME_MAPPINGS as _PR_NAMES,
+    )
+    NODE_CLASS_MAPPINGS = {**NODE_CLASS_MAPPINGS, **_PR_CLASSES}
+    NODE_DISPLAY_NAME_MAPPINGS = {**NODE_DISPLAY_NAME_MAPPINGS, **_PR_NAMES}
+except Exception as _err:  # pragma: no cover
+    print(f'[CtxRush] K2 Prompt Rewriter indisponivel: {_err!r}')
+
+
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
