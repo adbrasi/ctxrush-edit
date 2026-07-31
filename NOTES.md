@@ -62,3 +62,24 @@
 - At the close of this test, the main ComfyUI had restarted as PID 652500
   after the functional patch and had 25.6 GiB staged on GPU. No training
   process was running. Unload/stop ComfyUI before the next 1024 training run.
+
+## 2026-07-31 — reference guidance and target-space masks
+
+- Added a separate controlled v3 path; the validated v2 implementation remains
+  unchanged.
+- `K2ReferenceGuider` uses explicit with/without-reference predictions instead
+  of scaling the clean latent. The full mode evaluates the bilinear
+  `negative/positive × reference off/on` surface, so text CFG and image
+  guidance are independent.
+- `runner_vae_only` retains the exact runner convention: the off branch zeros
+  the VAE reference but leaves Qwen3-VL grounded.
+- `K2ReferenceMask` mixes the measured reference delta in target latent space:
+  `v = v0 + G(x,y) * (v1-v0)`. Soft mask values feather linearly.
+- Endpoint invariants and spatial broadcasting are covered by six CPU-only
+  unit tests. No GPU inference was run while the 1024 training process was
+  active.
+- Controlled v3 reads `vl_image_label` from adapter metadata, rejects
+  unsupported `independent_condition=true` contracts, enforces `max_refs`, and
+  offers the runner's literal PIL crop-fit path.
+- The setup exposes all four conditioning corners. Apply the same ControlNet
+  to each and use `K2ReferenceConditioningPack` to preserve composability.

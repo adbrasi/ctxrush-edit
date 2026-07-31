@@ -71,6 +71,73 @@ passou de ponta a ponta em 1024 px e alterou a saída, sem interferir nas
 ControlNet de Flux/SDXL em Krea2. É necessário um checkpoint ControlNet
 treinado ou portado para os 6.144 canais e a geometria de tokens do Krea2.
 
+## v3 controlado — força real da imagem e máscara espacial
+
+O v2 acima continua sendo o caminho canônico e não foi substituído. Para
+controlar a influência total da referência, use os nodes separados:
+
+```text
+K2 Training Base
+  -> [LoRAs Krea2 adicionais, opcionais]
+  -> CtxRush - Krea 2 Multi-Ref Controlled (v3):model
+  -> K2 Reference Guider
+  -> SamplerCustomAdvanced
+
+Controlled (v3):reference_conditioning
+  -> K2 Reference Guider:reference_conditioning
+
+MASK -> K2 Reference Mask Strength
+     -> K2 Reference Guider:reference_mask
+```
+
+O guider mede duas predições sobre o mesmo `x` e timestep:
+
+```text
+v = v_sem_referencia + G(x,y) * (v_com_referencia - v_sem_referencia)
+```
+
+Consequências verificáveis:
+
+- força `1`, sem máscara: usa um fast path e devolve a predição canônica com
+  referência, sem fazer a subtração;
+- força `0`: usa a branch sem referência;
+- valores entre `0` e `1`: interpolação convexa;
+- valores acima de `1`: extrapolação na direção medida da referência;
+- máscara branca: força principal do guider;
+- máscara preta: `outside_strength`;
+- cinza/feather: interpolação linear entre as duas forças.
+
+O modo `full_off` controla os dois canais da imagem: zera os tokens VAE e usa
+conditioning Qwen sem vision blocks na branch desligada. Ele avalia os quatro
+cantos `negative/positive × reference off/on`, portanto texto e imagem viram
+eixos independentes. O modo `runner_vae_only` reproduz literalmente
+`--reference-guidance` do runner: zera apenas o VAE e mantém o Qwen grounded.
+
+Essa construção prova os endpoints e a interpolação, não a qualidade
+perceptual de cada valor. A branch totalmente desligada é uma intervenção de
+inferência (o treino atual não usou `condition_dropout`), e a autoatenção
+global pode propagar indiretamente informação entre áreas ao longo dos steps.
+A máscara controla diretamente a atualização espacial em cada step, mas não é
+uma garantia de segmentação rígida. Faça A/B pareado por seed.
+
+Para paridade use `reference_guidance=1`, sem máscara. Turbo usa
+`text_guidance=1`; Raw usa `5.5`. Com Turbo, mudar a força da referência custa
+normalmente dois forwards por step. Em Raw, `full_off` pode custar quatro
+forwards porque mede os quatro cantos explicitamente.
+
+`reference_resize=runner_pil` aplica o mesmo
+`PIL.ImageOps.fit(..., LANCZOS)` do runner. Use `comfy_tensor` apenas quando a
+referência veio de outro node como imagem float e não deve ser quantizada para
+8 bits.
+
+### ControlNet no caminho controlado
+
+O setup v3 também expõe as quatro saídas `CONDITIONING`. Para usar um
+ControlNet, aplique o mesmo controle às quatro branches e reconecte-as com
+`K2 Reference Conditioning Pack`. Isso mantém o ControlNet constante enquanto
+o guider mede somente o eixo da referência. A compatibilidade dos pesos ainda
+depende de existir um ControlNet realmente treinado para a arquitetura Krea2.
+
 ## Recommended workflow
 
 Use **CtxRush - Krea 2 Edit Setup** for normal work:
