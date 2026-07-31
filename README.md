@@ -11,6 +11,12 @@ reference + prompt -> Qwen3-VL -> image-grounded conditioning
 
 No third-party Python packages are required beyond ComfyUI's own environment.
 
+> **Algo deu errado, ou você acabou de atualizar o ComfyUI?**
+> Leia [`MANUTENCAO.md`](MANUTENCAO.md). Estes nodes dependem de internals do
+> ComfyUI e o modo de falha caro é **silencioso** — a imagem sai, e está errada.
+> O documento tem a tabela sintoma→causa, a régua numérica e o checklist de
+> pós-atualização.
+
 ## Installation
 
 Copy the `ctxrush_edit` directory into `ComfyUI/custom_nodes` and restart
