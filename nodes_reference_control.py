@@ -401,6 +401,17 @@ class CtxRushKrea2MultiRefControlledApply:
                     "FLOAT",
                     {"default": 1.0, "min": 0.1, "max": 4.0, "step": 0.1},
                 ),
+                "native_conditioning": (
+                    "CONDITIONING",
+                    {
+                        "tooltip": "Revezamento: CONDITIONING do TextEncodeQwenImageEdit "
+                        "(com reference_latents). Enquanto a janela geral da LoRA está "
+                        "FECHADA (ex.: start_percent 0.2 → primeiros steps), o forward "
+                        "roda o caminho de referência NATIVO do Krea 2 com este "
+                        "conditioning; quando a janela abre, troca para o contrato "
+                        "treinado. Sem isto, fora da janela roda o base sem ref nativa.",
+                    },
+                ),
             },
         }
 
@@ -465,6 +476,7 @@ class CtxRushKrea2MultiRefControlledApply:
         end_percent=1.0,
         strength_curve="constant",
         curve_power=1.0,
+        native_conditioning=None,
         training_vl_contract=True,
         training_base_quant=True,
         debug=False,
@@ -571,6 +583,25 @@ class CtxRushKrea2MultiRefControlledApply:
             patched.model.process_latent_in(latent)
             for latent in reference_latents
         ]
+        # Revezamento: fase nativa (janela da LoRA fechada) usa o conditioning
+        # do TextEncodeQwenImageEdit e os ref_latents dele pelo forward STOCK
+        # do Krea 2 (frame axis + index_timestep_zero do próprio checkpoint).
+        native_context = None
+        native_refs = []
+        native_ref_method = None
+        if native_conditioning is not None:
+            entry = native_conditioning[0]
+            native_context = entry[0]
+            extras = entry[1] if len(entry) > 1 else {}
+            for lat in extras.get("reference_latents") or []:
+                native_refs.append(patched.model.process_latent_in(lat))
+            native_ref_method = extras.get("reference_latents_method")
+            if not native_refs:
+                print(
+                    "[K2Controlled] AVISO: native_conditioning sem "
+                    "reference_latents — a fase nativa roda só com texto.",
+                    flush=True,
+                )
         blocks_state = {"entries": block_entries, "device": None}
         # Janelas de atuação em sigmas; preenchidas DEPOIS do patch de
         # sampling (percent_to_sigma depende do mu). Fora da janela do bias,
@@ -614,6 +645,34 @@ class CtxRushKrea2MultiRefControlledApply:
                 strength_curve,
                 curve_power,
             )
+            if multiplier <= 0.0 and native_context is not None:
+                ctx = native_context.to(device=x.device)
+                if ctx.shape[0] != x.shape[0]:
+                    ctx = ctx.repeat(x.shape[0], *([1] * (ctx.ndim - 1)))
+                refs = [
+                    r.to(device=x.device, dtype=x.dtype) for r in native_refs
+                ]
+                extra = (
+                    {"ref_latents_method": native_ref_method}
+                    if native_ref_method is not None
+                    else {}
+                )
+                if _DEBUG["on"]:
+                    print(
+                        f"[K2Controlled][debug] sigma={sigma:.4f} fase NATIVA "
+                        f"(janela da LoRA fechada): conditioning qwen-edit + "
+                        f"{len(refs)} ref_latents pelo forward stock",
+                        flush=True,
+                    )
+                return executor(
+                    x,
+                    timesteps,
+                    ctx,
+                    None,
+                    refs,
+                    transformer_options,
+                    **extra,
+                )
             effective_bias = _windowed_bias(ref_bias, timesteps, bias_window)
             if _DEBUG["on"]:
                 print(
