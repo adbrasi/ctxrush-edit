@@ -40,6 +40,7 @@ resolução (raw) ou 1.15 (turbo), janela/curva de strength por step.
 
 import contextlib
 import json
+import math
 import struct
 
 import torch
@@ -397,7 +398,8 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
                             fusion_entries, strength, transformer_options,
                             fusion_strength, reference_timestep, slot_axis,
                             position_offset, text_attention_mask=None,
-                            training_base_quant=False, control=None):
+                            training_base_quant=False, control=None,
+                            ref_bias=1.0):
     """Espelho fiel de Krea2MultiRefInitialLayer.forward (o que treinou):
     N spans concatenados após o target, offset RoPE cumulativo por slot,
     t=0 (ou target) per-token nos spans, txtfusion antes do txtmlp."""
@@ -471,6 +473,11 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
 
     fusion_scale = strength if fusion_strength is None else fusion_strength
     use_fusion = bool(fusion_entries) and fusion_scale > 0
+    if use_fusion and fusion_entries[0][1].device != device:
+        fusion_entries[:] = [
+            (entry[0], entry[1].to(device), entry[2].to(device), *entry[3:])
+            for entry in fusion_entries
+        ]
     with _FullLoraScope(fusion_entries, fusion_scale) if use_fusion else _NullScope():
         context = m.txtfusion(context, mask=None, transformer_options=transformer_options)
     _elo_save(dump_prefix, 'context_txtfusion', context)
@@ -571,7 +578,37 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
         if text_valid.shape[1] != txtlen:  # contrato quebrado -> nao arrisca
             text_valid = torch.ones(bs, txtlen, dtype=torch.bool, device=device)
     image_valid = torch.ones(bs, tgtlen + reflen, dtype=torch.bool, device=device)
-    attention_mask = torch.cat([text_valid, image_valid], dim=1)[:, None, None, :]
+    # Ramo "sem referência" do guider: as chaves da ref saem da atenção para os
+    # itens do batch marcados off. Com softmax renormalizando sobre as chaves
+    # restantes, isto é matematicamente idêntico a uma sequência SEM o span —
+    # o baseline in-distribution (T2I puro) — em vez do span zerado, que é um
+    # ponto que nenhum step de treino jamais produziu.
+    branch_flags = transformer_options.get('ctxrush_k2_reference_branches')
+    branch_indices = transformer_options.get('cond_or_uncond')
+    if branch_flags is not None and branch_indices and bs % len(branch_indices) == 0:
+        chunk = bs // len(branch_indices)
+        for batch_index, branch_index in enumerate(branch_indices):
+            if 0 <= int(branch_index) < len(branch_flags) \
+                    and not branch_flags[int(branch_index)]:
+                image_valid[batch_index * chunk:(batch_index + 1) * chunk,
+                            tgtlen:] = False
+    valid_keys = torch.cat([text_valid, image_valid], dim=1)
+    if math.isclose(float(ref_bias), 1.0, rel_tol=0.0, abs_tol=1e-9):
+        attention_mask = valid_keys[:, None, None, :]
+    else:
+        # ref_bias (contrato do comfyui-krea2edit `_ref_attn_bias`): viés
+        # aditivo de log(b) nos logits alvo→ref, dentro do softmax. b<1 tira
+        # atenção da ref (antídoto de cópia), b>1 amplifica. Só as rows do
+        # alvo recebem o viés; texto e ref atendem como sempre. Alocada direto
+        # no dtype de compute (fp32 intermediária custava centenas de MB) e
+        # com finfo.min em vez de -inf (sem risco de NaN em row toda mascarada).
+        attention_mask = torch.zeros(
+            bs, 1, seq_len, seq_len, device=device, dtype=combined.dtype)
+        attention_mask[:, :, txtlen:txtlen + tgtlen, txtlen + tgtlen:] = \
+            math.log(max(float(ref_bias), 1e-4))
+        attention_mask.masked_fill_(
+            ~valid_keys[:, None, None, :],
+            torch.finfo(combined.dtype).min)
     if _DEBUG['calls'] == 1:
         _elo_sequence_snapshot(
             dump_prefix, 'layer00_initial', combined, txtlen, tgtlen,
@@ -581,8 +618,9 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
     if _DEBUG['on'] and _DEBUG['calls'] == 1:
         origem = 'conditioning' if text_attention_mask is not None else 'ASSUMIDA (tudo valido)'
         _dbg(f'mascara de atencao: shape={tuple(attention_mask.shape)} '
-             f'chaves validas={int(attention_mask.sum())}/{seq_len} '
-             f'(texto {int(text_valid.sum())}/{txtlen}) | origem={origem}')
+             f'chaves validas={valid_keys.sum(dim=1).tolist()}/{seq_len} '
+             f'(texto {int(text_valid.sum())}/{txtlen}) | ref_bias={ref_bias} '
+             f'| origem={origem}')
 
     quant_ctx = (_TrainingBaseQuant(entries)
                  if (training_base_quant and _DEBUG['calls'] == 1) else _NullScope())

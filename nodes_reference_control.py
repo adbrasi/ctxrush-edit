@@ -36,6 +36,7 @@ from .nodes import (
     _apply_krea2_sampling,
     _crop_fit,
     _ctxrush_layer_scales,
+    _ctxrush_schedule_mult,
     _empty_krea_latent,
     _fit_vl,
     _krea2_raw_mu,
@@ -147,6 +148,41 @@ def _crop_fit_runner_pil(image, width, height):
     )
     output = np.asarray(fitted, dtype=np.float32).copy() / 255.0
     return torch.from_numpy(output).unsqueeze(0)
+
+
+def _schedule_mult_sigma(sigma, window, curve, power):
+    """Multiplicador da janela geral na MESMA régua da janela do ref_bias
+    (percent_to_sigma, shift-aware — percent = fração dos steps). Substitui a
+    convenção progress=1-sigma do v2, que na grade turbo (sigma mínimo 0.31)
+    tornava end>=0.69 um no-op e start>=0.69 um kill-switch."""
+    hi, lo = window.get("hi"), window.get("lo")
+    if hi is None:
+        return 1.0
+    if not (lo - 1e-6 <= sigma <= hi + 1e-6):
+        return 0.0
+    span = max(1e-6, hi - lo)
+    u = min(1.0, max(0.0, (hi - sigma) / span))
+    if curve == "constant":
+        value = 1.0
+    elif curve == "fade_out":
+        value = 1.0 - u
+    elif curve == "fade_in":
+        value = u
+    else:  # fade_in_out
+        value = 1.0 - abs(2.0 * u - 1.0)
+    return max(0.0, value) ** max(0.05, float(power))
+
+
+def _windowed_bias(ref_bias, timesteps, bias_window):
+    """ref_bias dentro da janela [start,end] do schedule (convenção ControlNet:
+    percent 0 = primeiro step, sigma alto); 1.0 (desligado) fora dela."""
+    hi = bias_window.get("hi")
+    if hi is None or math.isclose(float(ref_bias), 1.0, rel_tol=0.0, abs_tol=1e-9):
+        return float(ref_bias)
+    sigma = float(timesteps.flatten()[0])
+    if bias_window["lo"] - 1e-6 <= sigma <= hi + 1e-6:
+        return float(ref_bias)
+    return 1.0
 
 
 def _reference_batch_for_branches(references, x, transformer_options):
@@ -293,6 +329,78 @@ class CtxRushKrea2MultiRefControlledApply:
                     },
                 ),
                 "debug": ("BOOLEAN", {"default": False}),
+                # Widgets novos SEMPRE anexados no FIM: o frontend mapeia
+                # widgets_values por posição; inserir no meio remapeia
+                # silenciosamente qualquer workflow salvo antes do diff
+                # (foi a causa de "ref_bias/janela não funcionam").
+                "ref_bias": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.05,
+                        "max": 8.0,
+                        "step": 0.05,
+                        "tooltip": "Additive log-bias on target→reference attention "
+                        "logits (comfyui-krea2edit ref_boost contract). <1 pulls "
+                        "attention away from the reference (anti-copy), >1 "
+                        "amplifies it — saturating: effective ratio is "
+                        "b/(1+(b-1)·ref_mass). 1.0 = off, zero cost.",
+                    },
+                ),
+                "ref_bias_start_percent": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "Schedule window start for ref_bias (fraction of "
+                        "steps; 0.0 = first step). With 8 turbo steps the window "
+                        "quantizes to 1/8 increments.",
+                    },
+                ),
+                "ref_bias_end_percent": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "Schedule window end for ref_bias. E.g. "
+                        "0.0→0.5 biases only the composition-deciding first "
+                        "half of the steps.",
+                    },
+                ),
+                "start_percent": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "General LoRA application window start (fraction "
+                        "of steps, same ruler as the ref_bias window): outside it "
+                        "block+fusion strengths drop to 0.",
+                    },
+                ),
+                "end_percent": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "General LoRA application window end.",
+                    },
+                ),
+                "strength_curve": (
+                    ["constant", "fade_out", "fade_in", "fade_in_out"],
+                    {"default": "constant"},
+                ),
+                "curve_power": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.1, "max": 4.0, "step": 0.1},
+                ),
             },
         }
 
@@ -350,6 +458,13 @@ class CtxRushKrea2MultiRefControlledApply:
         layers="all",
         layer_taper="flat",
         reference_resize="runner_pil",
+        ref_bias=1.0,
+        ref_bias_start_percent=0.0,
+        ref_bias_end_percent=1.0,
+        start_percent=0.0,
+        end_percent=1.0,
+        strength_curve="constant",
+        curve_power=1.0,
         training_vl_contract=True,
         training_base_quant=True,
         debug=False,
@@ -457,6 +572,11 @@ class CtxRushKrea2MultiRefControlledApply:
             for latent in reference_latents
         ]
         blocks_state = {"entries": block_entries, "device": None}
+        # Janelas de atuação em sigmas; preenchidas DEPOIS do patch de
+        # sampling (percent_to_sigma depende do mu). Fora da janela do bias,
+        # bias = 1.0; fora da janela geral, block+fusion = 0.
+        bias_window = {}
+        lora_window = {}
 
         if debug:
             _dbg(
@@ -487,6 +607,22 @@ class CtxRushKrea2MultiRefControlledApply:
                 x,
                 transformer_options,
             )
+            sigma = float(timesteps.flatten()[0])
+            multiplier = _schedule_mult_sigma(
+                sigma,
+                lora_window,
+                strength_curve,
+                curve_power,
+            )
+            effective_bias = _windowed_bias(ref_bias, timesteps, bias_window)
+            if _DEBUG["on"]:
+                print(
+                    f"[K2Controlled][debug] sigma={sigma:.4f} "
+                    f"ref_bias_efetivo={effective_bias} "
+                    f"(janela sigma [{bias_window.get('lo')}, {bias_window.get('hi')}]) "
+                    f"multiplicador_geral={multiplier:.3f}",
+                    flush=True,
+                )
             return _krea2_multiref_forward(
                 executor.class_obj,
                 x,
@@ -495,15 +631,16 @@ class CtxRushKrea2MultiRefControlledApply:
                 references,
                 blocks_state,
                 fusion_entries,
-                block_strength,
+                block_strength * multiplier,
                 transformer_options,
-                fusion_strength=fusion_strength,
+                fusion_strength=fusion_strength * multiplier,
                 reference_timestep=contract["reference_timestep"],
                 slot_axis=contract["slot_axis"],
                 position_offset=contract["position_offset"],
                 text_attention_mask=text_mask,
                 training_base_quant=training_base_quant,
                 control=kwargs.get("control"),
+                ref_bias=effective_bias,
             )
 
         transformer_options = patched.model_options.setdefault(
@@ -524,6 +661,26 @@ class CtxRushKrea2MultiRefControlledApply:
             else KREA2_TURBO_MU
         )
         patched = _apply_krea2_sampling(patched, mu)
+        sampling = patched.get_model_object("model_sampling")
+        bias_window["hi"] = float(sampling.percent_to_sigma(ref_bias_start_percent))
+        bias_window["lo"] = float(sampling.percent_to_sigma(ref_bias_end_percent))
+        lora_window["hi"] = float(sampling.percent_to_sigma(start_percent))
+        lora_window["lo"] = float(sampling.percent_to_sigma(end_percent))
+        print(
+            f"[K2Controlled] runtime LoRA: {len(block_entries)} blocks (masked, "
+            f"{block_strength}) + {len(fusion_entries)} txtfusion (global, "
+            f"{fusion_strength}) | ref_bias={ref_bias}",
+            flush=True,
+        )
+        if debug:
+            print(
+                f"[K2Controlled][debug] recebido: ref_bias={ref_bias} "
+                f"janela_bias start={ref_bias_start_percent} end={ref_bias_end_percent} "
+                f"-> sigma [{bias_window['lo']:.4f}, {bias_window['hi']:.4f}] | "
+                f"janela_geral start={start_percent} end={end_percent} "
+                f"curva={strength_curve} power={curve_power} mu={mu}",
+                flush=True,
+            )
         steps, cfg = (28, 5.5) if model_variant == "raw" else (8, 1.0)
         conditioning = {
             "positive_with_reference": positive_with_reference,

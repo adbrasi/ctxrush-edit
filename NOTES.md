@@ -83,3 +83,20 @@
   offers the runner's literal PIL crop-fit path.
 - The setup exposes all four conditioning corners. Apply the same ControlNet
   to each and use `K2ReferenceConditioningPack` to preserve composability.
+
+## Auditoria dos dials v3 (2026-08-06, 5 agentes opus + testes CPU com pesos reais)
+- BUG1 (corrigido): widgets novos inseridos no MEIO do optional remapeavam workflows
+  salvos por posição (training_vl_contract->ref_bias etc.) => janela do ref_bias
+  sempre vazia. Regra permanente: widget novo SEMPRE no fim do bloco.
+- BUG2 (corrigido): janela geral usava progress=1-sigma cru (end>=0.69 no-op,
+  start>=0.69 kill-switch na grade turbo). Agora _schedule_mult_sigma na mesma
+  régua percent_to_sigma da janela do bias (percent = fração dos steps).
+- BUG3 (corrigido): máscara do ref_bias alocava (bs,1,L,L) fp32 + cópia bf16
+  (centenas de MB/step). Agora direto no dtype de compute + finfo.min.
+- Não-bug provado: ref_bias>1 satura por renormalização (razão efetiva
+  b/(1+(b-1)*massa_ref); b=4 mede só 1.85-2.69x). Janela quantiza em 9 estados
+  com 8 steps (testar 0.00/0.13/0.26, não 0.05). block_strength NÃO move massa
+  de atenção (invariante em s) — ele gira o CONTEÚDO de K/V da ref; massa = ref_bias.
+- Aberto: "block/fusion acima de 1.0 sem efeito" não reproduzido em CPU (linear,
+  sem clamp; saturação refutada em teste com 28 blocos reais). Decidir com as
+  linhas de debug em runtime (strength: blocks=..., ref_bias_efetivo=...).
