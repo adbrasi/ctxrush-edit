@@ -646,7 +646,7 @@ class CtxRushKrea2MultiRefControlledApply:
                 curve_power,
             )
             if multiplier <= 0.0 and native_context is not None:
-                ctx = native_context.to(device=x.device)
+                ctx = native_context.to(device=x.device, dtype=x.dtype)
                 if ctx.shape[0] != x.shape[0]:
                     ctx = ctx.repeat(x.shape[0], *([1] * (ctx.ndim - 1)))
                 refs = [
