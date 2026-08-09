@@ -1,5 +1,26 @@
 # Notes
 
+## 2026-08-08 — storage fp8 no K2 Training Base (crash em máquinas fracas)
+
+- Sintoma: ComfyUI morria DURANTE a execução do `K2 Training Base` em
+  placas/máquinas mais fracas. Causa: o node materializava as 224 Linears em
+  bf16 (2 bytes/peso) — +11,3 GiB de RAM anônima crescendo ao longo do loop,
+  com o checkpoint de 13 GiB ainda residente; o kernel matava o processo.
+- Correção: `weight_storage=fp8_1byte` (novo default) guarda o próprio tensor
+  `float8_e4m3fn`; o `cast_bias_weight` sobe fp8→bf16 por camada no forward.
+  O cast é EXATO (todo ponto do grid e4m3fn é representável em bf16), então a
+  saída é bit-idêntica ao storage bf16 — provado em
+  `tests/test_trainbase_storage.py` (4 testes CPU, incl. fusão da turbo) e no
+  checkpoint real (paridade bit a bit de pesos + forward CPU + forward CUDA +
+  merge da turbo com LoRA sintética; 224/224 convertidas, `.diff_b` ignoradas).
+- Junto: `layout_type`/`quant_format` zerados nos módulos convertidos (senão o
+  `set_weight` chamaria `requantize_from_float` num tensor plano ao assar LoRA
+  adicional e crasharia; com None ele faz `weight.to(fp8)` = grid cru, como o
+  runner). `bf16_2bytes` mantido como legado; widget novo no FIM do optional
+  (regra da auditoria). Contrato de idempotência agora inclui o storage.
+- Números: pesos das 224 Linears 11,32 GiB (fp8) vs 22,64 GiB (bf16 antigo).
+  Na máquina de 30 GiB da validação, o caminho antigo somaria ~34 GiB → OOM.
+
 ## 2026-07-30 — runner parity
 
 - Root cause: training/runner converts the scaled-FP8 checkpoint to raw

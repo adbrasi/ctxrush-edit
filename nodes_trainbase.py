@@ -31,7 +31,16 @@ adaLN dos 28 blocos) em 1,8%. Aqui a turbo é fundida do jeito do runner.
 Ordem exata reproduzida:  W = fp8( fp8(W_dequantizado) + up@down )
 
 Este node NÃO cria arquivo nenhum: opera nos pesos já carregados, tensor a
-tensor (sem pico de memória), e é idempotente.
+tensor, e é idempotente.
+
+STORAGE (2026-08-08): como os valores finais estão TODOS no grid fp8, guardar
+o tensor em fp8 (1 byte/peso) e deixar o `cast_bias_weight` do ComfyUI subir
+para bf16 POR CAMADA no forward é bit-idêntico a materializar bf16 — cast
+fp8->bf16 é exato. A versão antiga materializava bf16 (2 bytes/peso) e
+DOBRAVA o modelo na RAM/VRAM (~+11 GiB no Krea2), derrubando ComfyUI em
+placas/máquinas mais fracas; além disso a contabilidade de memória do
+ComfyUI (model_size) ficava pela metade do tamanho real. O default agora é
+`fp8_1byte`; `bf16_2bytes` continua disponível como legado.
 """
 
 import torch
@@ -50,18 +59,41 @@ def _is_quantized(t):
     return t.__class__.__name__ == 'QuantizedTensor'
 
 
-def _to_training_grid(t):
-    """W -> fp8_e4m3fn puro (sem escala) -> de volta ao dtype de compute.
+def _to_training_grid(t, weight_storage='fp8_1byte'):
+    """W -> fp8_e4m3fn puro (sem escala), no storage pedido.
 
-    Voltar para bf16 é deliberado: o trainer marca `comfy_cast_weights=True`
-    (base.py:553), ou seja o matmul acontece em bf16 sobre valores que estão
-    no grid fp8. Deixar o tensor em fp8 faria o comfy_kitchen usar GEMM fp8
-    nativo — que o enxame mediu como PIOR (relL2 0.178 contra 0.031).
+    O matmul acontece em bf16 nos dois modos: o trainer marca
+    `comfy_cast_weights=True` (base.py:553), ou seja o GEMM roda em bf16 sobre
+    valores que estão no grid fp8. Deixar o comfy_kitchen usar GEMM fp8 nativo
+    seria PIOR (relL2 0.178 contra 0.031) — por isso quem chama também zera o
+    `layout_type` e força `_full_precision_mm`.
+
+    - `fp8_1byte` (default): guarda o PRÓPRIO tensor fp8. O
+      `cast_bias_weight` sobe fp8->bf16 por camada no forward, cast exato
+      (os valores já são pontos do grid fp8). 1 byte/peso, mesma memória do
+      checkpoint original.
+    - `bf16_2bytes` (legado): materializa bf16 — 2 bytes/peso, modelo dobrado.
     """
     if _is_quantized(t):
         t = t.dequantize()          # <- o passo que faltava na 1a tentativa
     out_dtype = t.dtype if t.dtype in (torch.bfloat16, torch.float16, torch.float32) else torch.bfloat16
-    return t.to(torch.float8_e4m3fn).to(out_dtype)
+    grid = t.to(torch.float8_e4m3fn)
+    if weight_storage == 'bf16_2bytes':
+        return grid.to(out_dtype)
+    return grid
+
+
+def _disarm_quant_machinery(module):
+    """O peso do módulo virou tensor plano: desliga o caminho quantizado.
+
+    Sem isso, `set_weight` (ops.py) chamaria `requantize_from_float` num
+    tensor plano ao assar um LoRA adicional e crasharia com AttributeError.
+    Com `layout_type=None` ele cai em `weight.to(self.weight.dtype)` — que,
+    para storage fp8, re-quantiza o peso+delta no grid fp8 CRU, o mesmo que o
+    runner faz ao somar deltas.
+    """
+    module.layout_type = None
+    module.quant_format = None
 
 
 def _force_bf16_matmul(module):
@@ -111,6 +143,14 @@ class K2TrainingBase:
                                'LoraLoaderModelOnly — os dois juntos aplicariam a turbo duas vezes.'}),
                 'turbo_strength': ('FLOAT', {'default': 1.0, 'min': 0.0, 'max': 2.0, 'step': 0.05}),
                 'verbose': ('BOOLEAN', {'default': True}),
+                # widget novo SEMPRE no fim do bloco (regra da auditoria 2026-08-06:
+                # inserir no meio remapeia workflows salvos por posicao).
+                'weight_storage': (['fp8_1byte', 'bf16_2bytes'], {'default': 'fp8_1byte',
+                    'tooltip': 'Como guardar as Linears re-quantizadas. fp8_1byte: o proprio tensor '
+                               'fp8 (1 byte/peso; o ComfyUI casta para bf16 por camada no forward — '
+                               'cast exato, saida bit-identica, metade da RAM/VRAM). bf16_2bytes: '
+                               'comportamento antigo, materializa bf16 e DOBRA o modelo '
+                               '(~+11 GiB no Krea2 — era isso que derrubava placas fracas).'}),
             },
         }
 
@@ -121,7 +161,7 @@ class K2TrainingBase:
                    'como o runner). Sem checkpoint extra, sem arquivo novo.')
 
     def apply(self, model, fp8_training_grid, turbo_lora='nenhuma',
-              turbo_strength=1.0, verbose=True):
+              turbo_strength=1.0, verbose=True, weight_storage='fp8_1byte'):
         out = model.clone()
         dit = out.get_model_object('diffusion_model')
 
@@ -129,7 +169,8 @@ class K2TrainingBase:
             if verbose:
                 print(f'[K2TrainingBase] {msg}', flush=True)
 
-        contract = (bool(fp8_training_grid), str(turbo_lora), float(turbo_strength))
+        contract = (bool(fp8_training_grid), str(turbo_lora), float(turbo_strength),
+                    str(weight_storage))
         previous_contract = getattr(dit, '_ctxrush_training_base_contract', None)
         if previous_contract is not None:
             if previous_contract == contract:
@@ -145,18 +186,29 @@ class K2TrainingBase:
             f'{", ".join(KEEP_IN_HIGH_PRECISION)})')
 
         # --- 1) base no grid fp8 do treino --------------------------------
-        n_quant = 0
+        n_quant, n_params = 0, 0
         if fp8_training_grid:
             for full, module in targets.items():
                 w = module.weight
-                new = _to_training_grid(w.data if isinstance(w, nn.Parameter) else w)
+                cur = w.data if isinstance(w, nn.Parameter) else w
+                new = _to_training_grid(cur, weight_storage)
                 module.register_parameter('weight', nn.Parameter(new, requires_grad=False))
                 # matmul em alta precisao sobre valores no grid fp8 (base.py:553)
                 module.comfy_cast_weights = True
+                _disarm_quant_machinery(module)
                 _force_bf16_matmul(module)
+                n_params += new.numel()
                 n_quant += 1
-            log(f'base re-quantizada no grid fp8 do treino: {n_quant} Linears; '
-                'GEMM BF16 forcado')
+                del cur, new
+            gib = n_params / (1024 ** 3)   # 1 byte/peso de diferenca entre os modos
+            if weight_storage == 'bf16_2bytes':
+                log(f'base re-quantizada no grid fp8 do treino: {n_quant} Linears; '
+                    f'GEMM BF16 forcado; storage bf16 LEGADO (+{gib:.1f} GiB vs fp8_1byte '
+                    '— use fp8_1byte em placas com pouca VRAM/RAM)')
+            else:
+                log(f'base re-quantizada no grid fp8 do treino: {n_quant} Linears; '
+                    f'GEMM BF16 forcado; storage fp8 1 byte/peso '
+                    f'({gib:.1f} GiB a menos que o storage bf16 antigo, saida identica)')
 
         # --- 2) turbo fundida do jeito do runner --------------------------
         n_fused, n_skipped = 0, 0
@@ -188,10 +240,15 @@ class K2TrainingBase:
                 up = du['up'].to(base_w.device, torch.float32)
                 down = du['down'].to(base_w.device, torch.float32)
                 delta = (up @ down).reshape(base_w.shape).to(torch.float32)
+                del up, down
                 merged = base_w.to(torch.float32) + float(turbo_strength) * delta
+                del delta, base_w, cur
                 if fp8_training_grid and base in targets:
                     # re-quantiza DEPOIS da soma: W = fp8(fp8(W_deq) + delta)
-                    merged = merged.to(torch.float8_e4m3fn).to(dtype)
+                    merged = merged.to(torch.float8_e4m3fn)
+                    if weight_storage == 'bf16_2bytes':
+                        merged = merged.to(dtype)
+                    _disarm_quant_machinery(module)
                 else:
                     merged = merged.to(dtype)
                 module.register_parameter('weight', nn.Parameter(merged, requires_grad=False))
@@ -199,12 +256,20 @@ class K2TrainingBase:
                 if base in targets:
                     _force_bf16_matmul(module)
                 n_fused += 1
+                del merged
             del sd
             log(f'turbo fundida em {n_fused} Linears (como o runner) | '
                 f'{diff_b} chaves .diff_b IGNORADAS (o runner tambem ignora) | '
                 f'{n_skipped} sem match')
 
         dit._ctxrush_training_base_contract = contract
+
+        # devolve ao alocador os transitorios do dequantize/merge o quanto antes;
+        # em maquinas justas de RAM isso evita o pico que derrubava o processo.
+        import gc
+        gc.collect()
+        comfy.model_management.soft_empty_cache()
+
         log('pronto — NAO use LoraLoaderModelOnly para a turbo junto com este node')
         return (out,)
 

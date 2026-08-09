@@ -52,6 +52,7 @@ voltou.
 | saída muda se você reordena os loaders | turbo entrando pelo `LoraLoaderModelOnly` | §4.2 |
 | mesma seed dá imagem diferente do runner | RNG do ruído (CPU vs CUDA) | §4.5 |
 | erro de contrato ao carregar adapter | metadata × config divergentes | §6 |
+| ComfyUI morre DURANTE o K2 Training Base (OOM/kill) | `weight_storage=bf16_2bytes` (legado) dobra o modelo em RAM | §4.1 |
 | Runner Bridge morre com OOM | VRAM não liberada antes do subprocesso | §5 |
 | Runner Bridge: "runner nao encontrado" | env var de caminho | §5 |
 | tudo parece certo e o resultado é ruim | **meça, não confie** | §1, §7 |
@@ -105,6 +106,23 @@ checkpoint permanente.
    `_full_precision_mm = True` (`ops.py:1277-1282`), senão cai no GEMM fp8
    nativo: 0,178 em vez de 0,031. É o `_force_bf16_matmul()`
    (`nodes_trainbase.py:67`).
+
+**Storage (2026-08-08): fp8 de 1 byte, não bf16.** A primeira versão do node
+materializava as 224 Linears em bf16 (2 bytes/peso), o que **dobrava o modelo
+em RAM/VRAM (~+11 GiB no Krea2) durante a execução do node** e derrubava o
+ComfyUI em máquinas mais fracas — além de deixar a contabilidade de memória do
+ComfyUI (`model_size`) pela metade do tamanho real. Como TODOS os valores
+finais são pontos do grid fp8, o default agora guarda o próprio tensor
+`float8_e4m3fn` (1 byte/peso) e deixa o `cast_bias_weight` subir para bf16
+por camada no forward — cast **exato**, saída bit-idêntica (provado em
+`tests/test_trainbase_storage.py` e num A/B com o checkpoint real: paridade
+bit a bit de pesos, forward CPU e forward CUDA). O widget `weight_storage`
+(`fp8_1byte` default / `bf16_2bytes` legado) fica no fim do bloco optional.
+Junto com o storage fp8, o node zera `layout_type`/`quant_format` do módulo:
+sem isso, o `set_weight` do ComfyUI chamaria `requantize_from_float` num
+tensor plano ao assar um LoRA adicional e crasharia; com `layout_type=None`
+ele cai em `weight.to(fp8)`, que re-quantiza peso+delta no grid CRU — a mesma
+convenção do runner.
 
 **Como verificar que ainda funciona:** o node loga quantas Linears converteu.
 Se logar 0, ou se `_is_quantized()` (`nodes_trainbase.py:49`) parar de
