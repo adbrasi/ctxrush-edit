@@ -329,3 +329,20 @@ commits `01835ff` (causa raiz fp8), `df36df8` (training_base_quant) e `2c7ae4c`
 | `K2 Runner Bridge + 3 LoRAs` | idem, com até 3 LoRAs extras |
 | `K2 Load Models` / `Adapter` / `Reference Encode` / `Conditioning` / `Sampler` / `Decode` | pack K2 Native, controle total do pipeline |
 | `K2 Prompt Rewriter (system + pedido)` | monta system prompt + pedido para um LLM externo |
+
+---
+
+## ref_skip_sigma (02/11/2026)
+
+Widget novo no fim do optional do **Multi-Ref Grounded (v2)** e do **Multi-Ref Controlled (v3)**: enquanto o
+sigma do passo for maior que `ref_skip_sigma`, as chaves VAE da referência saem da atenção (mesmo mecanismo do ramo
+"sem referência" do guider). O Qwen3-VL continua vendo a imagem. `1.0` = desligado (default, comportamento antigo
+intacto); `-1` = auto, que lê `inference_ref_skip_sigma` da metadata do adapter.
+
+- **Adapters BETA1-R3** (treinados com `ref_vae_mask_above_t`): use o mesmo valor do treino (auto / 0.92). Assim o
+  treino e a inferência ficam no mesmo contrato.
+- **Adapters antigos (BETA1-R etc.)**: é um paliativo anti-cópia. Ele zerou a cópia do BETA1-R step 1000 em 44
+  amostras, mas em cenários com elementos novos **duplica personagens ou cola a referência como painel extra**. Use
+  com cuidado.
+- No Krea 2, o `timesteps` que chega ao forward é o próprio sigma (ModelSamplingFlux CONST, multiplicador 1).
+  Turbo 8 passos (mu 1.15): σ = 1.0, 0.957, 0.905, … → 0.92 pula 2 passos. Raw 28 a 512px: pula ~4.

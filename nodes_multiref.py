@@ -399,7 +399,7 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
                             fusion_strength, reference_timestep, slot_axis,
                             position_offset, text_attention_mask=None,
                             training_base_quant=False, control=None,
-                            ref_bias=1.0):
+                            ref_bias=1.0, ref_skip_sigma=1.0):
     """Espelho fiel de Krea2MultiRefInitialLayer.forward (o que treinou):
     N spans concatenados após o target, offset RoPE cumulativo por slot,
     t=0 (ou target) per-token nos spans, txtfusion antes do txtmlp."""
@@ -592,6 +592,15 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
                     and not branch_flags[int(branch_index)]:
                 image_valid[batch_index * chunk:(batch_index + 1) * chunk,
                             tgtlen:] = False
+    # ref_skip_sigma: com sigma acima do limiar, as chaves da referência saem da
+    # atenção (mesmo mecanismo do ramo sem referência). No Krea 2 o timestep que
+    # chega aqui é o próprio sigma (ModelSamplingFlux CONST, multiplicador 1).
+    if float(ref_skip_sigma) < 1.0:
+        sigma_now = float(timesteps.flatten()[0]) if torch.is_tensor(timesteps) else float(timesteps)
+        if sigma_now > float(ref_skip_sigma):
+            image_valid[:, tgtlen:] = False
+            if _DEBUG['on']:
+                _dbg(f'ref_skip_sigma: sigma={sigma_now:.4f} > {ref_skip_sigma} -> referência VAE pulada')
     valid_keys = torch.cat([text_valid, image_valid], dim=1)
     if math.isclose(float(ref_bias), 1.0, rel_tol=0.0, abs_tol=1e-9):
         attention_mask = valid_keys[:, None, None, :]
@@ -716,6 +725,15 @@ def _krea2_multiref_forward(m, x, timesteps, context, ref_latents, blocks_state,
     return out
 
 
+def _resolve_ref_skip_sigma(value, metadata):
+    """-1 = auto: usa inference_ref_skip_sigma da metadata do adapter (BETA1-R3), senão desligado."""
+    value = float(value)
+    if value < 0:
+        value = float((metadata or {}).get('inference_ref_skip_sigma', 1.0))
+        print(f'[CtxRush] ref_skip_sigma auto = {value} (metadata do adapter)', flush=True)
+    return min(max(value, 0.0), 1.0)
+
+
 class CtxRushKrea2MultiRefApply:
     """All-in-one v2 para adapters krea2_multiref_grounded: contrato lido da
     metadata do adapter, N referências (offset cumulativo), grounding com cap
@@ -788,6 +806,9 @@ class CtxRushKrea2MultiRefApply:
                                      'modelos, contrato lido da metadata, prompt VL literal, geometria da '
                                      'sequencia, span da LoRA e — o mais importante — se o delta routado '
                                      'foi de fato aplicado. Ligue quando a saida "parecer" mas nao for.'}),
+                # widget novo SEMPRE no fim (workflows salvos mapeiam por posicao)
+                'ref_skip_sigma': ('FLOAT', {'default': 1.0, 'min': -1.0, 'max': 1.0, 'step': 0.01,
+                                   'tooltip': "Pula os tokens VAE da referência (chaves mascaradas, como o ramo 'sem referência') enquanto o sigma do passo for MAIOR que este valor; o Qwen3-VL continua vendo a imagem. 1.0 = desligado. Adapters treinados com ref_vae_mask_above_t (BETA1-R3) usam o MESMO valor (lido da metadata inference_ref_skip_sigma quando aqui = -1). Em adapters sem esse treino é paliativo anti-cópia e pode duplicar personagens. Turbo 8 passos: 0.92 pula 2 passos (σ 1.0 e 0.957)."}),
             },
         }
 
@@ -810,10 +831,11 @@ class CtxRushKrea2MultiRefApply:
               reference_noise=0.0, start_percent=0.0, end_percent=1.0,
               strength_curve='constant', curve_power=1.0,
               layers='all', layer_taper='flat', training_vl_contract=True,
-              training_base_quant=True, debug=False):
+              training_base_quant=True, debug=False, ref_skip_sigma=1.0):
         _DEBUG.update(on=bool(debug), calls=0, lora_hits=0, lora_misses=0, logged=False)
         lora_path = folder_paths.get_full_path('loras', lora_name)
         metadata = _read_safetensors_metadata(lora_path)
+        ref_skip_sigma = _resolve_ref_skip_sigma(ref_skip_sigma, metadata)
         contract = _resolve_contract(metadata, vl_max_pixels, vl_image_label, reference_timestep)
 
         if debug:
@@ -1003,6 +1025,7 @@ class CtxRushKrea2MultiRefApply:
                 text_attention_mask=text_mask,
                 training_base_quant=training_base_quant,
                 control=kwargs.get('control'),
+                ref_skip_sigma=ref_skip_sigma,
             )
 
         to = patched.model_options.setdefault('transformer_options', {})

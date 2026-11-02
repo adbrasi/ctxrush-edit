@@ -49,6 +49,7 @@ from .nodes_multiref import (
     _dbg,
     _krea2_multiref_forward,
     _read_safetensors_metadata,
+    _resolve_ref_skip_sigma,
     _resolve_contract,
     _training_vl_contract,
 )
@@ -412,6 +413,12 @@ class CtxRushKrea2MultiRefControlledApply:
                         "treinado. Sem isto, fora da janela roda o base sem ref nativa.",
                     },
                 ),
+                # widget novo SEMPRE no fim (workflows salvos mapeiam por posicao)
+                "ref_skip_sigma": (
+                    "FLOAT",
+                    {"default": 1.0, "min": -1.0, "max": 1.0, "step": 0.01,
+                     "tooltip": "Pula os tokens VAE da referência (chaves mascaradas, como o ramo 'sem referência') enquanto o sigma do passo for MAIOR que este valor; o Qwen3-VL continua vendo a imagem. 1.0 = desligado. Adapters treinados com ref_vae_mask_above_t (BETA1-R3) usam o MESMO valor (lido da metadata inference_ref_skip_sigma quando aqui = -1). Em adapters sem esse treino é paliativo anti-cópia e pode duplicar personagens. Turbo 8 passos: 0.92 pula 2 passos (σ 1.0 e 0.957)."},
+                ),
             },
         }
 
@@ -480,6 +487,7 @@ class CtxRushKrea2MultiRefControlledApply:
         training_vl_contract=True,
         training_base_quant=True,
         debug=False,
+        ref_skip_sigma=1.0,
     ):
         _DEBUG.update(
             on=bool(debug),
@@ -493,6 +501,7 @@ class CtxRushKrea2MultiRefControlledApply:
 
         lora_path = folder_paths.get_full_path("loras", lora_name)
         metadata = _read_safetensors_metadata(lora_path)
+        ref_skip_sigma_resolved = _resolve_ref_skip_sigma(ref_skip_sigma, metadata)
         contract = _resolve_control_contract(
             metadata,
             vl_max_pixels,
@@ -700,6 +709,7 @@ class CtxRushKrea2MultiRefControlledApply:
                 training_base_quant=training_base_quant,
                 control=kwargs.get("control"),
                 ref_bias=effective_bias,
+                ref_skip_sigma=ref_skip_sigma_resolved,
             )
 
         transformer_options = patched.model_options.setdefault(
